@@ -1,4 +1,4 @@
-# -*- coding: cp949 -*-
+# -*- coding: utf-8 -*-
 import os
 import secrets
 import sqlite3
@@ -30,9 +30,9 @@ USE_POSTGRES = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswi
 GRADE_TO_SCORE = {"S": 4, "A": 3, "B": 2, "C": 1}
 SCORE_TO_GRADE = {4: "S", 3: "A", 2: "B", 1: "C"}
 PEER_VISIBILITY_OPTIONS = {
-    "evaluator_only": "????? ????",
-    "admin_only": "??????? ????",
-    "admin_and_evaluator": "??????+???? ????",
+    "evaluator_only": "\ud3c9\uac00\uc790\ub9cc \uacf5\uac1c",
+    "admin_only": "\uad00\ub9ac\uc790\ub9cc \uacf5\uac1c",
+    "admin_and_evaluator": "\uad00\ub9ac\uc790+\ud3c9\uac00\uc790 \uacf5\uac1c",
 }
 
 
@@ -298,18 +298,18 @@ def init_db():
         db.executemany(
             "INSERT INTO users(name, email, role) VALUES (?, ?, ?)",
             [
-                ("HR Admin", "admin@company.local", "admin"),
-                ("Target Kim", "target1@company.local", "target"),
-                ("Target Park", "target2@company.local", "target"),
-                ("Leader Lee", "leader1@company.local", "evaluator"),
-                ("Leader Choi", "leader2@company.local", "evaluator"),
-                ("Leader Jung", "leader3@company.local", "evaluator"),
+                ("HR \uad00\ub9ac\uc790", "admin@company.local", "admin"),
+                ("\ub300\uc0c1\uc790 \uae40\uc218\uc2b5", "target1@company.local", "target"),
+                ("\ub300\uc0c1\uc790 \ubc15\uc218\uc2b5", "target2@company.local", "target"),
+                ("\ud3c9\uac00\uc790 \uc774\ub9ac\ub354", "leader1@company.local", "evaluator"),
+                ("\ud3c9\uac00\uc790 \ucd5c\ub9ac\ub354", "leader2@company.local", "evaluator"),
+                ("\ud3c9\uac00\uc790 \uc815\ub9ac\ub354", "leader3@company.local", "evaluator"),
             ],
         )
     if scalar_count(db, "evaluation_cycles") == 0:
         db.execute(
             "INSERT INTO evaluation_cycles(name, start_date, end_date) VALUES (?, ?, ?)",
-            ("2026 Q1 Probation Review", "2026-01-01", "2026-03-31"),
+            ("2026\ub144 1\ubd84\uae30 \uc218\uc2b5\ud3c9\uac00", "2026-01-01", "2026-03-31"),
         )
     if scalar_count(db, "assessment_items") == 0:
         db.executemany(
@@ -317,30 +317,30 @@ def init_db():
             [
                 (
                     "TEAM_CONTRIBUTION",
-                    "Team Goal Contribution",
-                    "Did this person contribute to agreed team priorities?",
-                    "Decisive impact beyond role.",
-                    "Solid contribution in agreed role.",
-                    "Delivery with frequent guidance needed.",
-                    "Low relevance or low quality output.",
+                    "\ud300\ubaa9\ud45c \uae30\uc5ec\ub3c4",
+                    "\uc785\uc0ac \uc2dc \ud569\uc758\ub41c \uc6b0\ub9ac \ud300\uc758 \ub2f9\uba74 \uacfc\uc81c \ud574\uacb0\uc5d0 \ubcf8\uc778\uc758 \uc5c5\ubb34\uac00 \uc2e4\uc81c\ub85c \uae30\uc5ec\ud588\uc2b5\ub2c8\uae4c?",
+                    "\ud575\uc2ec\ubb38\uc81c \ud574\uacb0 \ub610\ub294 \uc5ed\ud560 \ubc94\uc704\ub97c \ub118\uc5b4 \ud300 \ubaa9\ud45c \ub2ec\uc131\uc5d0 \uacb0\uc815\uc801 \uae30\uc5ec",
+                    "\ud569\uc758\ub41c \uc5ed\ud560 \ub0b4 \uc784\ubb34\ub97c \ucda9\uc2e4\ud788 \uc218\ud589\ud574 \ud300 \uacfc\uc81c \ud574\uacb0\uc5d0 \uae30\uc5ec",
+                    "\uc5c5\ubb34 \uc218\ud589\uc740 \ud588\uc73c\ub098 \uc8fc\ub3c4\uc131\uc774 \ubd80\uc871\ud574 \uc9c0\uc18d \uac00\uc774\ub4dc \ud544\uc694",
+                    "\ud300 \uacfc\uc81c\uc640 \ubb34\uad00\ud55c \uc5c5\ubb34 \ub610\ub294 \uacb0\uacfc\ubb3c \ud488\uc9c8 \ubbf8\ub2ec\ub85c \ud300\uc5d0 \ubd80\ub2f4",
                 ),
                 (
                     "TASK_ACHIEVEMENT",
-                    "Core Task Achievement",
-                    "Did this person achieve expected outcomes in three months?",
-                    "Exceeded target significantly.",
-                    "Met target and quality expectations.",
-                    "Around 80 percent or quality/timeline gaps.",
-                    "Significant miss or unusable quality.",
+                    "\ud575\uc2ec\uacfc\uc81c \ub2ec\uc131\ub3c4",
+                    "\ud569\uc758\uc11c\uc5d0 \uba85\uc2dc\ub41c 3\uac1c\uc6d4 \ub0b4 \uae30\ub300\uc131\uacfc\ub97c \uc815\uc131/\uc815\ub7c9\uc801\uc73c\ub85c \ub2ec\uc131\ud588\uc2b5\ub2c8\uae4c?",
+                    "\ubaa9\ud45c 120% \uc774\uc0c1 \ub610\ub294 \uae30\ub300 \uc218\uc900\uc744 \ud6e8\uc52c \uc0c1\ud68c",
+                    "\ubaa9\ud45c 100% \ub2ec\uc131 \ubc0f \ud569\uc758\ub41c \ud488\uc9c8 \ucda9\uc871",
+                    "\ubaa9\ud45c \uc57d 80% \ub2ec\uc131 \ub610\ub294 \uc77c\uc815/\ud488\uc9c8 \ubcf4\uc644 \ud544\uc694",
+                    "\ub2ec\uc131\ub960 70% \ubbf8\ub9cc \ub610\ub294 \uc2e4\ubb34 \ud65c\uc6a9\uc774 \uc5b4\ub824\uc6b4 \ud488\uc9c8",
                 ),
                 (
                     "BEHAVIOR_ALIGNMENT",
-                    "Behavior Alignment",
-                    "Did this person follow expected behaviors?",
-                    "Role model plus positive influence.",
-                    "Consistent behavior alignment.",
-                    "Mostly aligned with occasional correction needed.",
-                    "Repeated misalignment without improvement.",
+                    "\uae30\ub300\ud589\ub3d9 \ubd80\ud569\ub3c4",
+                    "\ud569\uc758\uc11c\uc5d0 \uba85\uc2dc\ub41c \uae30\ub300\ud589\ub3d9\uc744 \uc900\uc218\ud558\uc600\uc2b5\ub2c8\uae4c?",
+                    "\uc644\ubcbd \uc900\uc218\ub97c \ub118\uc5b4 \ud0c0\uc778 \ubaa8\ubc94 \ub610\ub294 \ub354 \ub098\uc740 \ud589\ub3d9 \uc591\uc2dd \uc81c\uc548",
+                    "\ud569\uc758\ub41c \ud589\ub3d9\uac00\uc774\ub4dc\ub97c \uc608\uc678 \uc5c6\uc774 \uc900\uc218",
+                    "\ub300\uccb4\ub85c \uc900\uc218\ud588\uc73c\ub098 \ud2b9\uc815 \uc0c1\ud669\uc5d0\uc11c \ud589\ub3d9 \uad50\uc815 \ud544\uc694",
+                    "\ud589\ub3d9\uae30\uc900 \ubc18\ubcf5 \uc704\ubc18 \ubc0f \uac1c\uc120 \uc694\uccad\uc5d0\ub3c4 \ubcc0\ud654 \ubd80\uc871",
                 ),
             ],
         )
@@ -392,9 +392,9 @@ def summarize_peer_comments(db, evaluatee_id):
         (evaluatee_id,),
     ).fetchall()
     if not rows:
-        return "?????? ???? ????? ???????."
+        return "\uc218\uc9d1\ub41c \ub3d9\ub8cc \uc758\uacac\uc774 \uc5c6\uc2b5\ub2c8\ub2e4."
     comments = [r["peer_comment"] for r in rows]
-    return f"?? {len(comments)}?? ????. ??? ???: {'; '.join(comments[:3])}"
+    return "\ucd1d {}\uac74 \uc218\uc9d1. \uc8fc\uc694 \uc758\uacac: {}".format(len(comments), "; ".join(comments[:3]))
 
 
 def get_peer_visibility(db):
@@ -446,11 +446,11 @@ def build_ai_questions(note):
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return (
-            "1. ??? ????? ??? ?????? ??? ??????? ??? ?????? ?????.\n"
-            "2. ???? ??????? ?????? ?????? ??? ?????? ????????????\n"
-            "3. ???? ?????? ?????? ???? ?????????\n"
-            "4. ???? ?????? ??? ???????? ?? ???? ????????\n"
-            "5. ???? 90?? ?????? ???? ???? ??? 1?????? ??????????"
+            "1. \uc774\ubc88 \ubc1c\ud45c\uc758 \ud575\uc2ec \uc131\uacfc\ub97c \uc218\uce58 \uc911\uc2ec\uc73c\ub85c \ub2e4\uc2dc \uc124\uba85\ud574 \uc8fc\uc138\uc694.\n"
+            "2. \uac00\uc7a5 \uc5b4\ub824\uc6e0\ub358 \uc758\uc0ac\uacb0\uc815 \uc21c\uac04\uacfc \ud310\ub2e8 \uae30\uc900\uc740 \ubb34\uc5c7\uc774\uc5c8\ub098\uc694?\n"
+            "3. \ud611\uc5c5 \uacfc\uc815\uc758 \ubcd1\ubaa9\uc744 \uc5b4\ub5bb\uac8c \ud574\uacb0\ud588\ub098\uc694?\n"
+            "4. \uac19\uc740 \uacfc\uc81c\ub97c \ub2e4\uc2dc \uc218\ud589\ud55c\ub2e4\uba74 \uc5b4\ub5a4 \uc810\uc744 \ubc14\uafb8\uaca0\ub098\uc694?\n"
+            "5. \ub2e4\uc74c 90\uc77c \ub3d9\uc548\uc758 \ucd5c\uc6b0\uc120 \uac1c\uc120 \ud56d\ubaa9 1\uac00\uc9c0\ub294 \ubb34\uc5c7\uc778\uac00\uc694?"
         )
     prompt = (
         "Generate 5 probation-review questions in Korean from this note. "
@@ -466,6 +466,21 @@ def build_ai_questions(note):
     response.raise_for_status()
     data = response.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+COMMON_STYLE = """
+<style>
+  body { font-family: 'Segoe UI', 'Malgun Gothic', sans-serif; max-width: 960px; margin: 24px auto; padding: 0 16px; color: #222; }
+  h2 { border-bottom: 2px solid #333; padding-bottom: 8px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+  th { background: #f5f5f5; }
+  button { padding: 6px 16px; cursor: pointer; }
+  .card { border: 1px solid #ccc; padding: 12px; margin: 10px 0; border-radius: 4px; }
+  a { color: #1a73e8; }
+  textarea { width: 100%; box-sizing: border-box; }
+</style>
+"""
 
 
 @app.route("/")
@@ -488,15 +503,15 @@ def login():
             return redirect(url_for("dashboard"))
     users = db.execute("SELECT * FROM users ORDER BY role, id").fetchall()
     return render_template_string(
-        """
-        <h2>?????? ????? ??????</h2>
+        COMMON_STYLE + """
+        <h2>\uc218\uc2b5\ud3c9\uac00 \uc2dc\uc2a4\ud15c \ub85c\uadf8\uc778</h2>
         <form method="post">
           <select name="user_id">
             {% for u in users %}
               <option value="{{u.id}}">{{u.name}} ({{u.role}})</option>
             {% endfor %}
           </select>
-          <button type="submit">??????</button>
+          <button type="submit">\ub85c\uadf8\uc778</button>
         </form>
         """,
         users=users,
@@ -572,10 +587,10 @@ def admin_dashboard():
         """
     ).fetchall()
     return render_template_string(
-        """
-        <h2>?????? ??????</h2>
-        <a href="{{url_for('logout')}}">??????</a>
-        <h3>?????? ???? ???</h3>
+        COMMON_STYLE + """
+        <h2>\uad00\ub9ac\uc790 \ub300\uc2dc\ubcf4\ub4dc</h2>
+        <a href="{{url_for('logout')}}">\ub85c\uadf8\uc544\uc6c3</a>
+        <h3>\ub3d9\ub8cc\ud3c9\uac00 \uacf5\uac1c \uc815\ucc45</h3>
         <form method="post">
           <input type="hidden" name="form_type" value="policy"/>
           <select name="peer_visibility">
@@ -583,30 +598,30 @@ def admin_dashboard():
               <option value="{{key}}" {% if key == peer_visibility %}selected{% endif %}>{{label}}</option>
             {% endfor %}
           </select>
-          <button type="submit">??? ????</button>
+          <button type="submit">\uc815\ucc45 \uc800\uc7a5</button>
         </form>
-        <h3>?? ????? ????</h3>
+        <h3>\ud3c9\uac00 \ub300\uc0c1\uc790 \uc0dd\uc131</h3>
         <form method="post">
-          <label>?????</label>
+          <label>\ub300\uc0c1\uc790</label>
           <select name="target_user_id">{% for t in targets %}<option value="{{t.id}}">{{t.name}}</option>{% endfor %}</select>
-          <label>?? ?????</label>
+          <label>\ud3c9\uac00 \uc0ac\uc774\ud074</label>
           <select name="cycle_id">{% for c in cycles %}<option value="{{c.id}}">{{c.name}}</option>{% endfor %}</select>
           <fieldset>
-            <legend>???? (??? 3??)</legend>
+            <legend>\ud3c9\uac00\uc790 (\ucd5c\ub300 3\uba85)</legend>
             {% for e in evaluators %}
               <label><input type="checkbox" name="evaluator_ids" value="{{e.id}}"> {{e.name}}</label><br/>
             {% endfor %}
           </fieldset>
-          <button type="submit">????</button>
+          <button type="submit">\uc0dd\uc131</button>
         </form>
-        <h3>????? ???</h3>
-        <table border="1" cellpadding="6">
-          <tr><th>ID</th><th>?????</th><th>?????</th><th>???? ???? ???</th><th>PT ????</th><th>????</th><th>???</th></tr>
+        <h3>\ub300\uc0c1\uc790 \ubaa9\ub85d</h3>
+        <table>
+          <tr><th>ID</th><th>\ub300\uc0c1\uc790</th><th>\uc0ac\uc774\ud074</th><th>\ub3d9\ub8cc \uc124\ubb38 \ub9c1\ud06c</th><th>PT \ud30c\uc77c</th><th>\ud310\uc815</th><th>\uc561\uc158</th></tr>
           {% for e in evaluatees %}
           <tr>
             <td>{{e.id}}</td><td>{{e.target_name}}</td><td>{{e.cycle_name}}</td><td>/peer-survey/{{e.peer_survey_token}}</td>
             <td>{{e.presentation_filename or '-'}}</td><td>{{e.decision or 'IN_PROGRESS'}}</td>
-            <td><a href="{{url_for('aggregate_result', evaluatee_id=e.id)}}">????</a> | <a href="{{url_for('deliver_feedback', evaluatee_id=e.id)}}">????</a></td>
+            <td><a href="{{url_for('aggregate_result', evaluatee_id=e.id)}}">\ucde8\ud569</a> | <a href="{{url_for('deliver_feedback', evaluatee_id=e.id)}}">\uc804\ub2ec</a></td>
           </tr>
           {% endfor %}
         </table>
@@ -627,7 +642,7 @@ def target_dashboard():
     user = current_user()
     evaluatee = db.execute("SELECT * FROM evaluatees WHERE user_id=? ORDER BY id DESC LIMIT 1", (user["id"],)).fetchone()
     if not evaluatee:
-        return "?????? ??? ???????."
+        return "\ubc30\uc815\ub41c \ud3c9\uac00\uac00 \uc5c6\uc2b5\ub2c8\ub2e4."
     items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
     existing = db.execute("SELECT * FROM self_assessments WHERE evaluatee_id=?", (evaluatee["id"],)).fetchall()
     existing_by_item = {row["item_id"]: row for row in existing}
@@ -660,14 +675,14 @@ def target_dashboard():
         return redirect(url_for("target_dashboard"))
     result = db.execute("SELECT * FROM aggregated_results WHERE evaluatee_id=?", (evaluatee["id"],)).fetchone()
     return render_template_string(
-        """
-        <h2>?? ????? ???</h2>
-        <a href="{{url_for('logout')}}">??????</a>
-        <h3>PT ?????? + ?????</h3>
+        COMMON_STYLE + """
+        <h2>\ud3c9\uac00 \ub300\uc0c1\uc790 \ud654\uba74</h2>
+        <a href="{{url_for('logout')}}">\ub85c\uadf8\uc544\uc6c3</a>
+        <h3>PT \uc5c5\ub85c\ub4dc + \uc790\uac00\ud3c9\uac00</h3>
         <form method="post" enctype="multipart/form-data">
           <input type="file" name="presentation"/><br/><br/>
           {% for item in items %}
-            <div style="border:1px solid #ccc; padding:8px; margin:8px 0;">
+            <div class="card">
               <b>{{item.title}}</b><br/><small>{{item.prompt}}</small><br/>
               {% set current = existing_by_item[item.id].grade if item.id in existing_by_item else 'B' %}
               {% for g in ['S','A','B','C'] %}
@@ -675,18 +690,18 @@ def target_dashboard():
               {% endfor %}
             </div>
           {% endfor %}
-          <label>Keep(???? ??)</label><br/><textarea name="keep_text" rows="3" cols="90">{{existing[0].keep_text if existing else ''}}</textarea><br/>
-          <label>Problem(????? ??)</label><br/><textarea name="problem_text" rows="3" cols="90">{{existing[0].problem_text if existing else ''}}</textarea><br/>
-          <label>Try(???? ???)</label><br/><textarea name="try_text" rows="3" cols="90">{{existing[0].try_text if existing else ''}}</textarea><br/>
-          <button type="submit">????</button>
+          <label>Keep(\uc798\ud55c \uc810)</label><br/><textarea name="keep_text" rows="3">{{existing[0].keep_text if existing else ''}}</textarea><br/>
+          <label>Problem(\uc544\uc26c\uc6b4 \uc810)</label><br/><textarea name="problem_text" rows="3">{{existing[0].problem_text if existing else ''}}</textarea><br/>
+          <label>Try(\uac1c\uc120 \uc2dc\ub3c4)</label><br/><textarea name="try_text" rows="3">{{existing[0].try_text if existing else ''}}</textarea><br/>
+          <button type="submit">\uc800\uc7a5</button>
         </form>
-        <h3>???</h3>
+        <h3>\uacb0\uacfc</h3>
         {% if result %}
-          <p><b>????:</b> {{result.decision}}</p>
-          <p><b>???:</b> {{result.summary}}</p>
-          <p><b>????:</b> {{result.admin_feedback or '-'}}</p>
+          <p><b>\ud310\uc815:</b> {{result.decision}}</p>
+          <p><b>\uc694\uc57d:</b> {{result.summary}}</p>
+          <p><b>\ud53c\ub4dc\ubc31:</b> {{result.admin_feedback or '-'}}</p>
         {% else %}
-          <p>???? ????? ??????? ???????.</p>
+          <p>\uc544\uc9c1 \uacb0\uacfc\uac00 \uc804\ub2ec\ub418\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4.</p>
         {% endif %}
         """,
         items=items,
@@ -781,7 +796,7 @@ def evaluator_dashboard():
         if peer_visibility in ("evaluator_only", "admin_and_evaluator"):
             peer_summary = summarize_peer_comments(db, selected)
         else:
-            peer_summary = "?????? ???? ??????? ??????? ?????????."
+            peer_summary = "\uad00\ub9ac\uc790 \uc804\uc6a9 \uc815\ucc45\uc73c\ub85c \ud3c9\uac00\uc790\uc5d0\uac8c \ube44\uacf5\uac1c\uc785\ub2c8\ub2e4."
         ai_row = db.execute(
             "SELECT suggested_questions FROM ai_question_logs WHERE evaluatee_id=? AND evaluator_user_id=? ORDER BY id DESC LIMIT 1",
             (selected, user["id"]),
@@ -789,42 +804,42 @@ def evaluator_dashboard():
         if ai_row:
             ai_questions = ai_row["suggested_questions"]
     return render_template_string(
-        """
-        <h2>???? ???</h2>
-        <a href="{{url_for('logout')}}">??????</a>
-        <h3>???? ?????</h3>
+        COMMON_STYLE + """
+        <h2>\ud3c9\uac00\uc790 \ud654\uba74</h2>
+        <a href="{{url_for('logout')}}">\ub85c\uadf8\uc544\uc6c3</a>
+        <h3>\ubc30\uc815 \ub300\uc0c1\uc790</h3>
         <ul>{% for a in assignments %}<li><a href="{{url_for('evaluator_dashboard', evaluatee_id=a.evaluatee_id)}}">{{a.target_name}}</a></li>{% endfor %}</ul>
         {% if detail %}
           <h3>{{detail.target_name}}</h3>
-          <p>PT ????: {% if detail.presentation_filename %}<a href="{{url_for('download_upload', filename=detail.presentation_filename)}}">{{detail.presentation_filename}}</a>{% else %}???????{% endif %}</p>
-          <p>?????? ????: {{peer_summary}}</p>
-          <h4>?????</h4>
+          <p>PT \ud30c\uc77c: {% if detail.presentation_filename %}<a href="{{url_for('download_upload', filename=detail.presentation_filename)}}">{{detail.presentation_filename}}</a>{% else %}\ubbf8\uc5c5\ub85c\ub4dc{% endif %}</p>
+          <p>\ub3d9\ub8cc\ud3c9\uac00 \ucde8\ud569: {{peer_summary}}</p>
+          <h4>\uc790\uac00\ud3c9\uac00</h4>
           {% for s in self_data %}
-            <div style="border:1px solid #ccc; padding:8px; margin:8px 0;">
+            <div class="card">
               <b>{{s.title}} - {{s.grade}}</b><br/>Keep: {{s.keep_text or '-'}}<br/>Problem: {{s.problem_text or '-'}}<br/>Try: {{s.try_text or '-'}}
             </div>
           {% endfor %}
-          <h4>???? ??</h4>
+          <h4>\ub9ac\ub354 \ud3c9\uac00</h4>
           <form method="post">
             <input type="hidden" name="evaluatee_id" value="{{detail.id}}"/>
             {% for item in items %}
               {% set current = leader_data[item.id].grade if item.id in leader_data else 'B' %}
-              <div style="border:1px solid #999; padding:8px; margin:8px 0;">
+              <div class="card">
                 <b>{{item.title}}</b><br/><small>{{item.prompt}}</small><br/>
                 {% for g in ['S','A','B','C'] %}
                   <label><input type="radio" name="grade_{{item.id}}" value="{{g}}" {% if g==current %}checked{% endif %}>{{g}}</label>
                 {% endfor %}
               </div>
             {% endfor %}
-            <label>PT ???</label><br/><textarea name="presentation_note" rows="3" cols="90">{{ leader_data.values()|list|first.presentation_note if leader_data else '' }}</textarea><br/>
-            <label>Q&A ???</label><br/><textarea name="qa_note" rows="3" cols="90">{{ leader_data.values()|list|first.qa_note if leader_data else '' }}</textarea><br/>
-            <label>????? ???? ????</label><br/><textarea name="feedback_text" rows="4" cols="90">{{ leader_data.values()|list|first.feedback_text if leader_data else '' }}</textarea><br/>
-            <button type="submit">????</button>
+            <label>PT \uba54\ubaa8</label><br/><textarea name="presentation_note" rows="3">{{ leader_data.values()|list|first.presentation_note if leader_data else '' }}</textarea><br/>
+            <label>Q&A \uba54\ubaa8</label><br/><textarea name="qa_note" rows="3">{{ leader_data.values()|list|first.qa_note if leader_data else '' }}</textarea><br/>
+            <label>\ub300\uc0c1\uc790 \uc804\ub2ec \ud53c\ub4dc\ubc31</label><br/><textarea name="feedback_text" rows="4">{{ leader_data.values()|list|first.feedback_text if leader_data else '' }}</textarea><br/>
+            <button type="submit">\uc800\uc7a5</button>
           </form>
-          <h4>AI ???? ????</h4>
+          <h4>AI \uc9c8\ubb38 \uc810\uac80</h4>
           <form method="post" action="{{url_for('ai_questions', evaluatee_id=detail.id)}}">
-            <textarea name="source_note" rows="4" cols="90" placeholder="???/???????? ??? ?????? ???????? ????????."></textarea><br/>
-            <button type="submit">???? ????</button>
+            <textarea name="source_note" rows="4" placeholder="\ubc1c\ud45c/\uc9c8\uc758\uc751\ub2f5 \uba54\ubaa8\ub97c \uc785\ub825\ud558\uba74 \uc9c8\ubb38\uc548\uc744 \uc0dd\uc131\ud569\ub2c8\ub2e4."></textarea><br/>
+            <button type="submit">\uc9c8\ubb38 \uc0dd\uc131</button>
           </form>
           {% if ai_questions %}<pre>{{ai_questions}}</pre>{% endif %}
         {% endif %}
@@ -874,15 +889,15 @@ def peer_survey(token):
                 (evaluatee["id"], peer_name, comment, now()),
             )
             db.commit()
-            return "???????????."
+            return "\uc81c\ucd9c\ub418\uc5c8\uc2b5\ub2c8\ub2e4."
     return render_template_string(
-        """
-        <h2>???? ?? ????</h2>
-        <p>?????: {{evaluatee.target_name}}</p>
+        COMMON_STYLE + """
+        <h2>\ub3d9\ub8cc \ud3c9\uac00 \uc124\ubb38</h2>
+        <p>\ub300\uc0c1\uc790: {{evaluatee.target_name}}</p>
         <form method="post">
-          <label>??? (????)</label><br/><input type="text" name="peer_name"/><br/>
-          <label>???</label><br/><textarea name="peer_comment" rows="6" cols="80" required></textarea><br/>
-          <button type="submit">????</button>
+          <label>\uc774\ub984 (\uc120\ud0dd)</label><br/><input type="text" name="peer_name"/><br/>
+          <label>\uc758\uacac</label><br/><textarea name="peer_comment" rows="6" required></textarea><br/>
+          <button type="submit">\uc81c\ucd9c</button>
         </form>
         """,
         evaluatee=evaluatee,
@@ -901,7 +916,7 @@ def aggregate_result(evaluatee_id):
     if peer_visibility in ("admin_only", "admin_and_evaluator"):
         peer_text = summarize_peer_comments(db, evaluatee_id)
     else:
-        peer_text = "?????? ????? ?????? ????? ???????."
+        peer_text = "\ub3d9\ub8cc\ud3c9\uac00 \uc694\uc57d\uc740 \uad00\ub9ac\uc790 \ube44\uacf5\uac1c \uc815\ucc45\uc785\ub2c8\ub2e4."
     summary = " / ".join(labels) + " / " + peer_text
     db.execute(
         """
@@ -924,7 +939,7 @@ def deliver_feedback(evaluatee_id):
     db = get_db()
     result = db.execute("SELECT * FROM aggregated_results WHERE evaluatee_id=?", (evaluatee_id,)).fetchone()
     if not result:
-        return "???? ?????? ?????? ?????."
+        return "\uba3c\uc800 \ucde8\ud569\uc744 \uc2e4\ud589\ud574 \uc8fc\uc138\uc694."
     if request.method == "POST":
         admin_feedback = request.form.get("admin_feedback", "")
         db.execute(
@@ -934,13 +949,13 @@ def deliver_feedback(evaluatee_id):
         db.commit()
         return redirect(url_for("admin_dashboard"))
     return render_template_string(
-        """
-        <h2>??? ????</h2>
-        <p>????: {{result.decision}}</p>
-        <p>???: {{result.summary}}</p>
+        COMMON_STYLE + """
+        <h2>\uacb0\uacfc \uc804\ub2ec</h2>
+        <p>\ud310\uc815: {{result.decision}}</p>
+        <p>\uc694\uc57d: {{result.summary}}</p>
         <form method="post">
-          <textarea name="admin_feedback" rows="6" cols="90">{{result.admin_feedback or ''}}</textarea><br/>
-          <button type="submit">????</button>
+          <textarea name="admin_feedback" rows="6">{{result.admin_feedback or ''}}</textarea><br/>
+          <button type="submit">\uc804\ub2ec</button>
         </form>
         """,
         result=result,
