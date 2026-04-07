@@ -468,19 +468,68 @@ def build_ai_questions(note):
     return data["candidates"][0]["content"]["parts"][0]["text"]
 
 
+DECISION_LABELS = {
+    "SUPER_PASS": "\ud569\uaca9 (\ud575\uc2ec\uc778\uc7ac)",
+    "PASS": "\ud569\uaca9 (\uc6b0\uc218\uc778\uc7ac)",
+    "EXTENSION": "\uc218\uc2b5 \uc5f0\uc7a5",
+    "FAIL": "\ubd88\ud569\uaca9",
+    "IN_PROGRESS": "\uc9c4\ud589 \uc911",
+}
+
 COMMON_STYLE = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>\uc218\uc2b5\ud3c9\uac00 \uc2dc\uc2a4\ud15c</title>
 <style>
-  body { font-family: 'Segoe UI', 'Malgun Gothic', sans-serif; max-width: 960px; margin: 24px auto; padding: 0 16px; color: #222; }
+  body { font-family: 'Segoe UI', 'Malgun Gothic', sans-serif; max-width: 960px; margin: 0 auto; padding: 16px; color: #222; }
+  nav { background: #2c3e50; padding: 10px 16px; border-radius: 6px; margin-bottom: 20px; }
+  nav a { color: #ecf0f1; text-decoration: none; margin-right: 16px; font-size: 14px; }
+  nav a:hover { text-decoration: underline; }
+  nav .right { float: right; }
   h2 { border-bottom: 2px solid #333; padding-bottom: 8px; }
   table { border-collapse: collapse; width: 100%; }
   th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
   th { background: #f5f5f5; }
-  button { padding: 6px 16px; cursor: pointer; }
-  .card { border: 1px solid #ccc; padding: 12px; margin: 10px 0; border-radius: 4px; }
+  button { padding: 8px 20px; cursor: pointer; background: #2c3e50; color: #fff; border: none; border-radius: 4px; }
+  button:hover { background: #1a252f; }
+  .card { border: 1px solid #ddd; padding: 14px; margin: 10px 0; border-radius: 6px; background: #fafafa; }
   a { color: #1a73e8; }
   textarea { width: 100%; box-sizing: border-box; }
+  fieldset { margin: 10px 0; padding: 12px; }
+  .grade-desc { font-size: 12px; color: #555; margin-left: 4px; }
+  select { padding: 4px 8px; }
+  input[type="file"] { margin: 4px 0; }
 </style>
+</head>
+<body>
 """
+
+
+FOOTER = "\n</body></html>"
+
+NAV_ADMIN = (
+    '<nav>'
+    '<a href="/admin">\ub300\uc2dc\ubcf4\ub4dc</a>'
+    '<a href="/admin/users">\uc0ac\uc6a9\uc790 \uad00\ub9ac</a>'
+    '<a href="/admin/cycles">\uc0ac\uc774\ud074 \uad00\ub9ac</a>'
+    '<a class="right" href="/logout">\ub85c\uadf8\uc544\uc6c3</a>'
+    '</nav>'
+)
+NAV_TARGET = (
+    '<nav>'
+    '<a href="/target">\ub300\uc2dc\ubcf4\ub4dc</a>'
+    '<a class="right" href="/logout">\ub85c\uadf8\uc544\uc6c3</a>'
+    '</nav>'
+)
+NAV_EVALUATOR = (
+    '<nav>'
+    '<a href="/evaluator">\ub300\uc2dc\ubcf4\ub4dc</a>'
+    '<a class="right" href="/logout">\ub85c\uadf8\uc544\uc6c3</a>'
+    '</nav>'
+)
 
 
 @app.route("/")
@@ -513,7 +562,7 @@ def login():
           </select>
           <button type="submit">\ub85c\uadf8\uc778</button>
         </form>
-        """,
+        """ + FOOTER,
         users=users,
     )
 
@@ -587,9 +636,8 @@ def admin_dashboard():
         """
     ).fetchall()
     return render_template_string(
-        COMMON_STYLE + """
+        COMMON_STYLE + NAV_ADMIN + """
         <h2>\uad00\ub9ac\uc790 \ub300\uc2dc\ubcf4\ub4dc</h2>
-        <a href="{{url_for('logout')}}">\ub85c\uadf8\uc544\uc6c3</a>
         <h3>\ub3d9\ub8cc\ud3c9\uac00 \uacf5\uac1c \uc815\ucc45</h3>
         <form method="post">
           <input type="hidden" name="form_type" value="policy"/>
@@ -620,18 +668,19 @@ def admin_dashboard():
           {% for e in evaluatees %}
           <tr>
             <td>{{e.id}}</td><td>{{e.target_name}}</td><td>{{e.cycle_name}}</td><td>/peer-survey/{{e.peer_survey_token}}</td>
-            <td>{{e.presentation_filename or '-'}}</td><td>{{e.decision or 'IN_PROGRESS'}}</td>
+            <td>{{e.presentation_filename or '-'}}</td><td>{{decision_labels.get(e.decision or 'IN_PROGRESS', e.decision or '\uc9c4\ud589 \uc911')}}</td>
             <td><a href="{{url_for('aggregate_result', evaluatee_id=e.id)}}">\ucde8\ud569</a> | <a href="{{url_for('deliver_feedback', evaluatee_id=e.id)}}">\uc804\ub2ec</a></td>
           </tr>
           {% endfor %}
         </table>
-        """,
+        """ + FOOTER,
         targets=targets,
         evaluators=evaluators,
         cycles=cycles,
         evaluatees=evaluatees,
         peer_visibility=peer_visibility,
         peer_visibility_options=PEER_VISIBILITY_OPTIONS,
+        decision_labels=DECISION_LABELS,
     )
 
 
@@ -675,18 +724,20 @@ def target_dashboard():
         return redirect(url_for("target_dashboard"))
     result = db.execute("SELECT * FROM aggregated_results WHERE evaluatee_id=?", (evaluatee["id"],)).fetchone()
     return render_template_string(
-        COMMON_STYLE + """
+        COMMON_STYLE + NAV_TARGET + """
         <h2>\ud3c9\uac00 \ub300\uc0c1\uc790 \ud654\uba74</h2>
-        <a href="{{url_for('logout')}}">\ub85c\uadf8\uc544\uc6c3</a>
         <h3>PT \uc5c5\ub85c\ub4dc + \uc790\uac00\ud3c9\uac00</h3>
         <form method="post" enctype="multipart/form-data">
+          <label><b>PT \ubc1c\ud45c \uc790\ub8cc</b></label><br/>
           <input type="file" name="presentation"/><br/><br/>
           {% for item in items %}
             <div class="card">
               <b>{{item.title}}</b><br/><small>{{item.prompt}}</small><br/>
               {% set current = existing_by_item[item.id].grade if item.id in existing_by_item else 'B' %}
               {% for g in ['S','A','B','C'] %}
-                <label><input type="radio" name="grade_{{item.id}}" value="{{g}}" {% if current==g %}checked{% endif %}>{{g}}</label>
+                <label><input type="radio" name="grade_{{item.id}}" value="{{g}}" {% if current==g %}checked{% endif %}>{{g}}
+                  <span class="grade-desc">({% if g=='S' %}{{item.grade_s}}{% elif g=='A' %}{{item.grade_a}}{% elif g=='B' %}{{item.grade_b}}{% else %}{{item.grade_c}}{% endif %})</span>
+                </label><br/>
               {% endfor %}
             </div>
           {% endfor %}
@@ -697,17 +748,18 @@ def target_dashboard():
         </form>
         <h3>\uacb0\uacfc</h3>
         {% if result %}
-          <p><b>\ud310\uc815:</b> {{result.decision}}</p>
+          <p><b>\ud310\uc815:</b> {{decision_labels.get(result.decision, result.decision)}}</p>
           <p><b>\uc694\uc57d:</b> {{result.summary}}</p>
           <p><b>\ud53c\ub4dc\ubc31:</b> {{result.admin_feedback or '-'}}</p>
         {% else %}
           <p>\uc544\uc9c1 \uacb0\uacfc\uac00 \uc804\ub2ec\ub418\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4.</p>
         {% endif %}
-        """,
+        """ + FOOTER,
         items=items,
         existing=existing,
         existing_by_item=existing_by_item,
         result=result,
+        decision_labels=DECISION_LABELS,
     )
 
 
@@ -770,6 +822,12 @@ def evaluator_dashboard():
     peer_summary = ""
     ai_questions = ""
     if selected:
+        assigned = db.execute(
+            "SELECT 1 FROM evaluator_assignments WHERE evaluatee_id=? AND evaluator_user_id=?",
+            (selected, user["id"]),
+        ).fetchone()
+        if not assigned:
+            abort(403)
         detail = db.execute(
             "SELECT e.id, e.presentation_filename, u.name AS target_name FROM evaluatees e JOIN users u ON u.id = e.user_id WHERE e.id = ?",
             (selected,),
@@ -804,16 +862,15 @@ def evaluator_dashboard():
         if ai_row:
             ai_questions = ai_row["suggested_questions"]
     return render_template_string(
-        COMMON_STYLE + """
+        COMMON_STYLE + NAV_EVALUATOR + """
         <h2>\ud3c9\uac00\uc790 \ud654\uba74</h2>
-        <a href="{{url_for('logout')}}">\ub85c\uadf8\uc544\uc6c3</a>
         <h3>\ubc30\uc815 \ub300\uc0c1\uc790</h3>
         <ul>{% for a in assignments %}<li><a href="{{url_for('evaluator_dashboard', evaluatee_id=a.evaluatee_id)}}">{{a.target_name}}</a></li>{% endfor %}</ul>
         {% if detail %}
           <h3>{{detail.target_name}}</h3>
           <p>PT \ud30c\uc77c: {% if detail.presentation_filename %}<a href="{{url_for('download_upload', filename=detail.presentation_filename)}}">{{detail.presentation_filename}}</a>{% else %}\ubbf8\uc5c5\ub85c\ub4dc{% endif %}</p>
           <p>\ub3d9\ub8cc\ud3c9\uac00 \ucde8\ud569: {{peer_summary}}</p>
-          <h4>\uc790\uac00\ud3c9\uac00</h4>
+          <h4>\uc790\uac00\ud3c9\uac00 \uc870\ud68c</h4>
           {% for s in self_data %}
             <div class="card">
               <b>{{s.title}} - {{s.grade}}</b><br/>Keep: {{s.keep_text or '-'}}<br/>Problem: {{s.problem_text or '-'}}<br/>Try: {{s.try_text or '-'}}
@@ -827,7 +884,9 @@ def evaluator_dashboard():
               <div class="card">
                 <b>{{item.title}}</b><br/><small>{{item.prompt}}</small><br/>
                 {% for g in ['S','A','B','C'] %}
-                  <label><input type="radio" name="grade_{{item.id}}" value="{{g}}" {% if g==current %}checked{% endif %}>{{g}}</label>
+                  <label><input type="radio" name="grade_{{item.id}}" value="{{g}}" {% if g==current %}checked{% endif %}>{{g}}
+                    <span class="grade-desc">({% if g=='S' %}{{item.grade_s}}{% elif g=='A' %}{{item.grade_a}}{% elif g=='B' %}{{item.grade_b}}{% else %}{{item.grade_c}}{% endif %})</span>
+                  </label><br/>
                 {% endfor %}
               </div>
             {% endfor %}
@@ -843,7 +902,7 @@ def evaluator_dashboard():
           </form>
           {% if ai_questions %}<pre>{{ai_questions}}</pre>{% endif %}
         {% endif %}
-        """,
+        """ + FOOTER,
         assignments=assignments,
         detail=detail,
         self_data=self_data,
@@ -899,7 +958,7 @@ def peer_survey(token):
           <label>\uc758\uacac</label><br/><textarea name="peer_comment" rows="6" required></textarea><br/>
           <button type="submit">\uc81c\ucd9c</button>
         </form>
-        """,
+        """ + FOOTER,
         evaluatee=evaluatee,
     )
 
@@ -949,16 +1008,134 @@ def deliver_feedback(evaluatee_id):
         db.commit()
         return redirect(url_for("admin_dashboard"))
     return render_template_string(
-        COMMON_STYLE + """
+        COMMON_STYLE + NAV_ADMIN + """
         <h2>\uacb0\uacfc \uc804\ub2ec</h2>
-        <p>\ud310\uc815: {{result.decision}}</p>
+        <p>\ud310\uc815: {{decision_labels.get(result.decision, result.decision)}}</p>
         <p>\uc694\uc57d: {{result.summary}}</p>
         <form method="post">
+          <label>\uad00\ub9ac\uc790 \ud53c\ub4dc\ubc31</label><br/>
           <textarea name="admin_feedback" rows="6">{{result.admin_feedback or ''}}</textarea><br/>
           <button type="submit">\uc804\ub2ec</button>
         </form>
-        """,
+        """ + FOOTER,
         result=result,
+        decision_labels=DECISION_LABELS,
+    )
+
+
+@app.route("/admin/users", methods=["GET", "POST"])
+@require_role("admin")
+def manage_users():
+    db = get_db()
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "add":
+            name = request.form.get("name", "").strip()
+            email = request.form.get("email", "").strip()
+            role = request.form.get("role", "target")
+            if name and email and role in ("admin", "target", "evaluator"):
+                db.execute(
+                    "INSERT INTO users(name, email, role) VALUES (?, ?, ?)",
+                    (name, email, role),
+                )
+                db.commit()
+        elif action == "delete":
+            user_id = request.form.get("user_id")
+            if user_id:
+                db.execute("DELETE FROM users WHERE id=?", (user_id,))
+                db.commit()
+        return redirect(url_for("manage_users"))
+    users = db.execute("SELECT * FROM users ORDER BY role, id").fetchall()
+    return render_template_string(
+        COMMON_STYLE + NAV_ADMIN + """
+        <h2>\uc0ac\uc6a9\uc790 \uad00\ub9ac</h2>
+        <h3>\uc0ac\uc6a9\uc790 \ucd94\uac00</h3>
+        <form method="post">
+          <input type="hidden" name="action" value="add"/>
+          <label>\uc774\ub984</label> <input type="text" name="name" required/>
+          <label>Email</label> <input type="email" name="email" required/>
+          <label>\uc5ed\ud560</label>
+          <select name="role">
+            <option value="target">\ud3c9\uac00\ub300\uc0c1\uc790</option>
+            <option value="evaluator">\ud3c9\uac00\uc790</option>
+            <option value="admin">\uad00\ub9ac\uc790</option>
+          </select>
+          <button type="submit">\ucd94\uac00</button>
+        </form>
+        <h3>\uc0ac\uc6a9\uc790 \ubaa9\ub85d</h3>
+        <table>
+          <tr><th>ID</th><th>\uc774\ub984</th><th>Email</th><th>\uc5ed\ud560</th><th>\uc561\uc158</th></tr>
+          {% for u in users %}
+          <tr>
+            <td>{{u.id}}</td><td>{{u.name}}</td><td>{{u.email}}</td>
+            <td>{% if u.role=='admin' %}\uad00\ub9ac\uc790{% elif u.role=='target' %}\ud3c9\uac00\ub300\uc0c1\uc790{% else %}\ud3c9\uac00\uc790{% endif %}</td>
+            <td>
+              <form method="post" style="display:inline">
+                <input type="hidden" name="action" value="delete"/>
+                <input type="hidden" name="user_id" value="{{u.id}}"/>
+                <button type="submit" onclick="return confirm('\uc0ad\uc81c\ud558\uc2dc\uaca0\uc2b5\ub2c8\uae4c?')">\uc0ad\uc81c</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </table>
+        """ + FOOTER,
+        users=users,
+    )
+
+
+@app.route("/admin/cycles", methods=["GET", "POST"])
+@require_role("admin")
+def manage_cycles():
+    db = get_db()
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "add":
+            name = request.form.get("name", "").strip()
+            start_date = request.form.get("start_date", "")
+            end_date = request.form.get("end_date", "")
+            if name:
+                db.execute(
+                    "INSERT INTO evaluation_cycles(name, start_date, end_date) VALUES (?, ?, ?)",
+                    (name, start_date, end_date),
+                )
+                db.commit()
+        elif action == "delete":
+            cycle_id = request.form.get("cycle_id")
+            if cycle_id:
+                db.execute("DELETE FROM evaluation_cycles WHERE id=?", (cycle_id,))
+                db.commit()
+        return redirect(url_for("manage_cycles"))
+    cycles = db.execute("SELECT * FROM evaluation_cycles ORDER BY id DESC").fetchall()
+    return render_template_string(
+        COMMON_STYLE + NAV_ADMIN + """
+        <h2>\ud3c9\uac00 \uc0ac\uc774\ud074 \uad00\ub9ac</h2>
+        <h3>\uc0ac\uc774\ud074 \ucd94\uac00</h3>
+        <form method="post">
+          <input type="hidden" name="action" value="add"/>
+          <label>\uc0ac\uc774\ud074\uba85</label> <input type="text" name="name" required/>
+          <label>\uc2dc\uc791\uc77c</label> <input type="date" name="start_date"/>
+          <label>\uc885\ub8cc\uc77c</label> <input type="date" name="end_date"/>
+          <button type="submit">\ucd94\uac00</button>
+        </form>
+        <h3>\uc0ac\uc774\ud074 \ubaa9\ub85d</h3>
+        <table>
+          <tr><th>ID</th><th>\uc0ac\uc774\ud074\uba85</th><th>\uc2dc\uc791\uc77c</th><th>\uc885\ub8cc\uc77c</th><th>\uc0c1\ud0dc</th><th>\uc561\uc158</th></tr>
+          {% for c in cycles %}
+          <tr>
+            <td>{{c.id}}</td><td>{{c.name}}</td><td>{{c.start_date or '-'}}</td><td>{{c.end_date or '-'}}</td><td>{{c.status}}</td>
+            <td>
+              <form method="post" style="display:inline">
+                <input type="hidden" name="action" value="delete"/>
+                <input type="hidden" name="cycle_id" value="{{c.id}}"/>
+                <button type="submit" onclick="return confirm('\uc0ad\uc81c\ud558\uc2dc\uaca0\uc2b5\ub2c8\uae4c?')">\uc0ad\uc81c</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </table>
+        """ + FOOTER,
+        cycles=cycles,
     )
 
 
