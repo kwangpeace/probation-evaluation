@@ -1374,7 +1374,7 @@ def target_dashboard():
         <div class="card">
           <p><b>판정:</b> {{dl.get(result.decision, result.decision)}}</p>
           <p style="margin-top:8px;"><b>피드백:</b></p>
-          <div style="white-space:pre-wrap;background:var(--gray-50);padding:14px;border-radius:8px;margin-top:6px;">{{result.ai_polished_feedback or result.admin_feedback or '-'}}</div>
+          <div style="white-space:pre-wrap;background:var(--gray-50);padding:14px;border-radius:8px;margin-top:6px;">{{result.admin_feedback or result.ai_polished_feedback or '-'}}</div>
         </div>
       {% else %}
         <p style="color:var(--gray-500);">아직 결과가 전달되지 않았습니다.</p>
@@ -1827,6 +1827,8 @@ def deliver_feedback(evaluatee_id):
     """, (evaluatee_id,)).fetchall()
     raw_feedbacks = "\n\n".join([f"[{RELATIONSHIP_OPTIONS.get(f['relationship'], f['relationship'])} - {f['evaluator_name']}]\n{f['feedback_text']}" for f in all_feedbacks])
 
+    already_delivered = bool(result["delivered_at"])
+
     if request.method == "POST":
         action = request.form.get("action", "deliver")
         if action == "ai_polish":
@@ -1836,11 +1838,20 @@ def deliver_feedback(evaluatee_id):
             log_action(db, "feedback_ai_polished", evaluatee_id=evaluatee_id, actor_user_id=actor["id"] if actor else None, detail="AI 종합 피드백 정리")
             db.commit()
             return redirect(url_for("deliver_feedback", evaluatee_id=evaluatee_id))
+        if action == "save_draft":
+            admin_feedback = request.form.get("admin_feedback", "")
+            db.execute("UPDATE aggregated_results SET admin_feedback=?, updated_at=? WHERE evaluatee_id=?",
+                       (admin_feedback, now(), evaluatee_id))
+            actor = current_user()
+            log_action(db, "feedback_draft_saved", evaluatee_id=evaluatee_id, actor_user_id=actor["id"] if actor else None, detail="피드백 임시 저장")
+            db.commit()
+            return redirect(url_for("deliver_feedback", evaluatee_id=evaluatee_id))
         admin_feedback = request.form.get("admin_feedback", "")
         db.execute("UPDATE aggregated_results SET admin_feedback=?, delivered_at=?, updated_at=? WHERE evaluatee_id=?",
                    (admin_feedback, now(), now(), evaluatee_id))
         actor = current_user()
-        log_action(db, "feedback_delivered", evaluatee_id=evaluatee_id, actor_user_id=actor["id"] if actor else None, detail="최종 피드백 전달")
+        action_label = "피드백 재전달" if already_delivered else "최종 피드백 전달"
+        log_action(db, "feedback_delivered", evaluatee_id=evaluatee_id, actor_user_id=actor["id"] if actor else None, detail=action_label)
         db.commit()
         return redirect(url_for("admin_dashboard"))
 
@@ -1885,17 +1896,23 @@ def deliver_feedback(evaluatee_id):
 
     <div class="section">
       <h3 style="margin-top:0;">최종 전달 피드백</h3>
+      {% if already_delivered %}
+      <div class="alert alert-success">이미 전달 완료된 피드백입니다 ({{result.delivered_at}}). 수정 후 재전달할 수 있습니다.</div>
+      {% endif %}
       <form method="post">
-        <input type="hidden" name="action" value="deliver"/>
         <div class="form-group">
-          <label>관리자 피드백 (대상자에게 직접 전달됨)</label>
-          <textarea name="admin_feedback" rows="8">{{result.ai_polished_feedback or result.admin_feedback or ''}}</textarea>
+          <label>관리자 피드백 <span style="font-weight:400;color:var(--danger);">⚠ 대상자에게 직접 전달되는 내용입니다</span></label>
+          <textarea name="admin_feedback" rows="10">{{result.admin_feedback or result.ai_polished_feedback or ''}}</textarea>
+          <p style="font-size:12px;color:var(--gray-400);margin-top:6px;">위 AI 정리 결과를 기반으로 자유롭게 수정하세요. 최종 리포트에도 이 내용이 반영됩니다.</p>
         </div>
-        <button type="submit" class="btn btn-success">대상자에게 전달</button>
+        <div style="display:flex;gap:12px;">
+          <button type="submit" name="action" value="save_draft" class="btn btn-outline">임시 저장</button>
+          <button type="submit" name="action" value="deliver" class="btn btn-success">{{'재전달' if already_delivered else '대상자에게 전달'}}</button>
+        </div>
       </form>
     </div>
     """ + FOOTER, result=result, target_name=target_name, all_feedbacks=all_feedbacks,
-        dl=DECISION_LABELS, rel_labels=RELATIONSHIP_OPTIONS)
+        dl=DECISION_LABELS, rel_labels=RELATIONSHIP_OPTIONS, already_delivered=already_delivered)
 
 
 # ---------------------------------------------------------------------------
@@ -2006,9 +2023,9 @@ def admin_report(evaluatee_id):
         {% elif d == 'FAIL' %}<span class="badge badge-danger" style="font-size:16px;padding:8px 20px;">{{dl[d]}}</span>
         {% else %}<span class="badge badge-gray" style="font-size:16px;padding:8px 20px;">{{dl[d]}}</span>{% endif %}
       </p>
-      {% if result.ai_polished_feedback or result.admin_feedback %}
+      {% if result.admin_feedback or result.ai_polished_feedback %}
       <h3>전달 피드백</h3>
-      <div style="white-space:pre-wrap;background:var(--gray-50);padding:18px;border-radius:8px;line-height:1.7;">{{result.ai_polished_feedback or result.admin_feedback}}</div>
+      <div style="white-space:pre-wrap;background:var(--gray-50);padding:18px;border-radius:8px;line-height:1.7;">{{result.admin_feedback or result.ai_polished_feedback}}</div>
       {% endif %}
     </div>
     {% endif %}
