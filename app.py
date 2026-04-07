@@ -2,12 +2,27 @@
 import os
 import secrets
 import sqlite3
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 
 import requests
-from flask import Flask, abort, g, redirect, render_template_string, request, send_from_directory, session, url_for
+from flask import Flask, Response, abort, g, redirect, render_template_string, request, send_from_directory, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
+try:
+    import boto3
+except ImportError:
+    boto3 = None
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build as gbuild
+    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+except ImportError:
+    service_account = None
+    gbuild = None
+    MediaIoBaseDownload = None
+    MediaIoBaseUpload = None
 try:
     import psycopg
     from psycopg.rows import dict_row
@@ -26,6 +41,16 @@ app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 _db_initialized = False
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = DATABASE_URL.startswith("postgresql://") or DATABASE_URL.startswith("postgres://")
+GOOGLE_DRIVE_ENABLED = os.getenv("GOOGLE_DRIVE_ENABLED", "false").lower() in ("1", "true", "yes")
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+_drive_service = None
+OBJECT_STORAGE_ENABLED = os.getenv("OBJECT_STORAGE_ENABLED", "false").lower() in ("1", "true", "yes")
+OBJECT_STORAGE_ENDPOINT = os.getenv("OBJECT_STORAGE_ENDPOINT", "").strip()
+OBJECT_STORAGE_REGION = os.getenv("OBJECT_STORAGE_REGION", "auto").strip()
+OBJECT_STORAGE_ACCESS_KEY = os.getenv("OBJECT_STORAGE_ACCESS_KEY", "").strip()
+OBJECT_STORAGE_SECRET_KEY = os.getenv("OBJECT_STORAGE_SECRET_KEY", "").strip()
+OBJECT_STORAGE_BUCKET = os.getenv("OBJECT_STORAGE_BUCKET", "").strip()
+_object_storage_client = None
 
 GRADE_TO_SCORE = {"S": 4, "A": 3, "B": 2, "C": 1}
 SCORE_TO_GRADE = {4: "S", 3: "A", 2: "B", 1: "C"}
@@ -82,6 +107,96 @@ def connect_db():
     return DBWrapper(conn, is_postgres=False)
 
 
+def get_drive_service():
+    global _drive_service
+    if not GOOGLE_DRIVE_ENABLED:
+        return None
+    if service_account is None or gbuild is None:
+        return None
+    if _drive_service is not None:
+        return _drive_service
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    cred_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    if raw_json:
+        import json
+
+        info = json.loads(raw_json)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    elif cred_file:
+        creds = service_account.Credentials.from_service_account_file(cred_file, scopes=scopes)
+    else:
+        return None
+    _drive_service = gbuild("drive", "v3", credentials=creds, cache_discovery=False)
+    return _drive_service
+
+
+def upload_to_google_drive(filename, file_bytes, content_type):
+    service = get_drive_service()
+    if service is None:
+        return None
+    media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=content_type or "application/octet-stream", resumable=False)
+    body = {"name": filename}
+    if GOOGLE_DRIVE_FOLDER_ID:
+        body["parents"] = [GOOGLE_DRIVE_FOLDER_ID]
+    created = service.files().create(body=body, media_body=media, fields="id").execute()
+    return created.get("id")
+
+
+def download_from_google_drive(file_id):
+    service = get_drive_service()
+    if service is None or not file_id:
+        return None, None, None
+    meta = service.files().get(fileId=file_id, fields="name,mimeType").execute()
+    request_obj = service.files().get_media(fileId=file_id)
+    buf = BytesIO()
+    downloader = MediaIoBaseDownload(buf, request_obj)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buf.seek(0)
+    return meta.get("name") or "presentation", meta.get("mimeType") or "application/octet-stream", buf.read()
+
+
+def get_object_storage_client():
+    global _object_storage_client
+    if not OBJECT_STORAGE_ENABLED or boto3 is None:
+        return None
+    if _object_storage_client is not None:
+        return _object_storage_client
+    if not (OBJECT_STORAGE_ENDPOINT and OBJECT_STORAGE_ACCESS_KEY and OBJECT_STORAGE_SECRET_KEY and OBJECT_STORAGE_BUCKET):
+        return None
+    _object_storage_client = boto3.client(
+        "s3",
+        endpoint_url=OBJECT_STORAGE_ENDPOINT,
+        aws_access_key_id=OBJECT_STORAGE_ACCESS_KEY,
+        aws_secret_access_key=OBJECT_STORAGE_SECRET_KEY,
+        region_name=OBJECT_STORAGE_REGION,
+    )
+    return _object_storage_client
+
+
+def upload_to_object_storage(object_key, file_bytes, content_type):
+    client = get_object_storage_client()
+    if client is None:
+        return False
+    client.put_object(
+        Bucket=OBJECT_STORAGE_BUCKET,
+        Key=object_key,
+        Body=file_bytes,
+        ContentType=content_type or "application/octet-stream",
+    )
+    return True
+
+
+def download_from_object_storage(object_key):
+    client = get_object_storage_client()
+    if client is None or not object_key:
+        return None, None
+    resp = client.get_object(Bucket=OBJECT_STORAGE_BUCKET, Key=object_key)
+    return resp.get("ContentType") or "application/octet-stream", resp["Body"].read()
+
+
 def scalar_count(db, table_name):
     row = db.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
     if row is None:
@@ -129,6 +244,8 @@ def init_db():
             cycle_id INTEGER NOT NULL,
             peer_survey_token TEXT NOT NULL UNIQUE,
             presentation_filename TEXT,
+            presentation_file_id TEXT,
+            presentation_storage TEXT NOT NULL DEFAULT 'local',
             self_submitted_at TEXT,
             created_at TEXT NOT NULL
         );
@@ -198,6 +315,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS peer_reviewers (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE
         );
         """
     else:
@@ -221,6 +342,8 @@ def init_db():
             cycle_id INTEGER NOT NULL,
             peer_survey_token TEXT NOT NULL UNIQUE,
             presentation_filename TEXT,
+            presentation_file_id TEXT,
+            presentation_storage TEXT NOT NULL DEFAULT 'local',
             self_submitted_at TEXT,
             created_at TEXT NOT NULL
         );
@@ -291,20 +414,54 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS peer_reviewers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE
+        );
         """
     db.executescript(schema_script)
+    # Runtime-safe migrations for existing databases.
+    if USE_POSTGRES:
+        db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
+        db.execute("ALTER TABLE evaluatees ADD COLUMN IF NOT EXISTS presentation_file_id TEXT")
+        db.execute("ALTER TABLE evaluatees ADD COLUMN IF NOT EXISTS presentation_storage TEXT NOT NULL DEFAULT 'local'")
+    else:
+        user_cols = db.execute("PRAGMA table_info(users)").fetchall()
+        user_col_names = {c["name"] if hasattr(c, "keys") else c[1] for c in user_cols}
+        if "password_hash" not in user_col_names:
+            db.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        eval_cols = db.execute("PRAGMA table_info(evaluatees)").fetchall()
+        eval_col_names = {c["name"] if hasattr(c, "keys") else c[1] for c in eval_cols}
+        if "presentation_file_id" not in eval_col_names:
+            db.execute("ALTER TABLE evaluatees ADD COLUMN presentation_file_id TEXT")
+        if "presentation_storage" not in eval_col_names:
+            db.execute("ALTER TABLE evaluatees ADD COLUMN presentation_storage TEXT NOT NULL DEFAULT 'local'")
 
     if scalar_count(db, "users") == 0:
         db.executemany(
-            "INSERT INTO users(name, email, role) VALUES (?, ?, ?)",
+            "INSERT INTO users(name, email, role, password_hash) VALUES (?, ?, ?, ?)",
             [
-                ("HR \uad00\ub9ac\uc790", "admin@company.local", "admin"),
-                ("\ub300\uc0c1\uc790 \uae40\uc218\uc2b5", "target1@company.local", "target"),
-                ("\ub300\uc0c1\uc790 \ubc15\uc218\uc2b5", "target2@company.local", "target"),
-                ("\ud3c9\uac00\uc790 \uc774\ub9ac\ub354", "leader1@company.local", "evaluator"),
-                ("\ud3c9\uac00\uc790 \ucd5c\ub9ac\ub354", "leader2@company.local", "evaluator"),
-                ("\ud3c9\uac00\uc790 \uc815\ub9ac\ub354", "leader3@company.local", "evaluator"),
+                ("HR \uad00\ub9ac\uc790", "admin@company.local", "admin", generate_password_hash("admin1234")),
+                ("\ub300\uc0c1\uc790 \uae40\uc218\uc2b5", "target1@company.local", "target", generate_password_hash("target1234")),
+                ("\ub300\uc0c1\uc790 \ubc15\uc218\uc2b5", "target2@company.local", "target", generate_password_hash("target1234")),
+                ("\ud3c9\uac00\uc790 \uc774\ub9ac\ub354", "leader1@company.local", "evaluator", generate_password_hash("leader1234")),
+                ("\ud3c9\uac00\uc790 \ucd5c\ub9ac\ub354", "leader2@company.local", "evaluator", generate_password_hash("leader1234")),
+                ("\ud3c9\uac00\uc790 \uc815\ub9ac\ub354", "leader3@company.local", "evaluator", generate_password_hash("leader1234")),
             ],
+        )
+    else:
+        # Backfill password hash for old rows.
+        db.execute(
+            "UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='admin'",
+            (generate_password_hash("admin1234"),),
+        )
+        db.execute(
+            "UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='target'",
+            (generate_password_hash("target1234"),),
+        )
+        db.execute(
+            "UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='evaluator'",
+            (generate_password_hash("leader1234"),),
         )
     if scalar_count(db, "evaluation_cycles") == 0:
         db.execute(
@@ -351,6 +508,15 @@ def init_db():
         ON CONFLICT(key) DO NOTHING
         """
     )
+    if scalar_count(db, "peer_reviewers") == 0:
+        db.executemany(
+            "INSERT INTO peer_reviewers(name) VALUES (?)",
+            [
+                ("\ub3d9\ub8cc\ud3c9\uac00\uc790 \uae40\ub3d9\ub8cc",),
+                ("\ub3d9\ub8cc\ud3c9\uac00\uc790 \uc774\ub3d9\ub8cc",),
+                ("\ub3d9\ub8cc\ud3c9\uac00\uc790 \ubc15\ub3d9\ub8cc",),
+            ],
+        )
     db.commit()
     db.close()
 
@@ -515,6 +681,7 @@ NAV_ADMIN = (
     '<a href="/admin">\ub300\uc2dc\ubcf4\ub4dc</a>'
     '<a href="/admin/users">\uc0ac\uc6a9\uc790 \uad00\ub9ac</a>'
     '<a href="/admin/cycles">\uc0ac\uc774\ud074 \uad00\ub9ac</a>'
+    '<a href="/admin/peers">\ub3d9\ub8cc\ud3c9\uac00\uc790 \uad00\ub9ac</a>'
     '<a class="right" href="/logout">\ub85c\uadf8\uc544\uc6c3</a>'
     '</nav>'
 )
@@ -545,25 +712,29 @@ def bootstrap():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     db = get_db()
+    error = ""
     if request.method == "POST":
-        user_id = request.form.get("user_id")
-        if db.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
-            session["user_id"] = int(user_id)
+        email = request.form.get("email", "").strip()
+        password = request.form.get("password", "")
+        user = db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        if user and user["password_hash"] and check_password_hash(user["password_hash"], password):
+            session["user_id"] = int(user["id"])
             return redirect(url_for("dashboard"))
-    users = db.execute("SELECT * FROM users ORDER BY role, id").fetchall()
+        error = "\ub85c\uadf8\uc778 \uc815\ubcf4\uac00 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4."
     return render_template_string(
         COMMON_STYLE + """
         <h2>\uc218\uc2b5\ud3c9\uac00 \uc2dc\uc2a4\ud15c \ub85c\uadf8\uc778</h2>
+        <p style="color:#666;">\uae30\ubcf8 \uacc4\uc815: admin@company.local / admin1234</p>
+        {% if error %}<p style="color:#c0392b;">{{error}}</p>{% endif %}
         <form method="post">
-          <select name="user_id">
-            {% for u in users %}
-              <option value="{{u.id}}">{{u.name}} ({{u.role}})</option>
-            {% endfor %}
-          </select>
+          <label>Email</label><br/>
+          <input type="email" name="email" required/><br/><br/>
+          <label>\ube44\ubc00\ubc88\ud638</label><br/>
+          <input type="password" name="password" required/><br/><br/>
           <button type="submit">\ub85c\uadf8\uc778</button>
         </form>
         """ + FOOTER,
-        users=users,
+        error=error,
     )
 
 
@@ -689,6 +860,7 @@ def admin_dashboard():
 def target_dashboard():
     db = get_db()
     user = current_user()
+    notice = request.args.get("notice", "")
     evaluatee = db.execute("SELECT * FROM evaluatees WHERE user_id=? ORDER BY id DESC LIMIT 1", (user["id"],)).fetchone()
     if not evaluatee:
         return "\ubc30\uc815\ub41c \ud3c9\uac00\uac00 \uc5c6\uc2b5\ub2c8\ub2e4."
@@ -698,9 +870,40 @@ def target_dashboard():
     if request.method == "POST":
         file = request.files.get("presentation")
         if file and file.filename:
-            filename = f"{evaluatee['id']}_{secure_filename(file.filename)}"
-            file.save(UPLOAD_DIR / filename)
-            db.execute("UPDATE evaluatees SET presentation_filename=? WHERE id=?", (filename, evaluatee["id"]))
+            UPLOAD_DIR.mkdir(exist_ok=True)
+            safe_name = secure_filename(file.filename)
+            if not safe_name:
+                safe_name = "presentation.pdf"
+            filename = f"{evaluatee['id']}_{int(datetime.now().timestamp())}_{safe_name}"
+            try:
+                content = file.read()
+                if OBJECT_STORAGE_ENABLED:
+                    object_key = f"presentations/{filename}"
+                    uploaded = upload_to_object_storage(object_key, content, file.mimetype)
+                    if uploaded:
+                        db.execute(
+                            "UPDATE evaluatees SET presentation_filename=?, presentation_file_id=?, presentation_storage='s3' WHERE id=?",
+                            (filename, object_key, evaluatee["id"]),
+                        )
+                        notice = "PT \ud30c\uc77c\uc774 \ud074\ub77c\uc6b0\ub4dc \uc800\uc7a5\uc18c\uc5d0 \uc800\uc7a5\ub418\uc5c8\uc2b5\ub2c8\ub2e4."
+                    else:
+                        with open(UPLOAD_DIR / filename, "wb") as fp:
+                            fp.write(content)
+                        db.execute(
+                            "UPDATE evaluatees SET presentation_filename=?, presentation_file_id=NULL, presentation_storage='local' WHERE id=?",
+                            (filename, evaluatee["id"]),
+                        )
+                        notice = "\ud074\ub77c\uc6b0\ub4dc \uc5f0\ub3d9 \uc2e4\ud328\ub85c \ub85c\uceec\uc5d0 \uc800\uc7a5\ub418\uc5c8\uc2b5\ub2c8\ub2e4."
+                else:
+                    with open(UPLOAD_DIR / filename, "wb") as fp:
+                        fp.write(content)
+                    db.execute(
+                        "UPDATE evaluatees SET presentation_filename=?, presentation_file_id=NULL, presentation_storage='local' WHERE id=?",
+                        (filename, evaluatee["id"]),
+                    )
+                    notice = "PT \ud30c\uc77c\uc774 \uc815\uc0c1 \uc800\uc7a5\ub418\uc5c8\uc2b5\ub2c8\ub2e4."
+            except OSError:
+                notice = "PT \ud30c\uc77c \uc800\uc7a5\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4. \ud30c\uc77c\uba85/\uc6a9\ub7c9\uc744 \ud655\uc778\ud574 \uc8fc\uc138\uc694."
         keep_text = request.form.get("keep_text", "")
         problem_text = request.form.get("problem_text", "")
         try_text = request.form.get("try_text", "")
@@ -721,15 +924,17 @@ def target_dashboard():
             )
         db.execute("UPDATE evaluatees SET self_submitted_at=? WHERE id=?", (now(), evaluatee["id"]))
         db.commit()
-        return redirect(url_for("target_dashboard"))
+        return redirect(url_for("target_dashboard", notice=notice))
     result = db.execute("SELECT * FROM aggregated_results WHERE evaluatee_id=?", (evaluatee["id"],)).fetchone()
     return render_template_string(
         COMMON_STYLE + NAV_TARGET + """
         <h2>\ud3c9\uac00 \ub300\uc0c1\uc790 \ud654\uba74</h2>
+        {% if notice %}<p style="color:#1e8449;"><b>{{notice}}</b></p>{% endif %}
         <h3>PT \uc5c5\ub85c\ub4dc + \uc790\uac00\ud3c9\uac00</h3>
         <form method="post" enctype="multipart/form-data">
           <label><b>PT \ubc1c\ud45c \uc790\ub8cc</b></label><br/>
           <input type="file" name="presentation"/><br/><br/>
+          <p>\ud604\uc7ac \uc800\uc7a5 \ud30c\uc77c: {% if evaluatee.presentation_filename %}<a href="{{url_for('presentation_file', evaluatee_id=evaluatee.id)}}">{{evaluatee.presentation_filename}}</a>{% else %}-{% endif %}</p>
           {% for item in items %}
             <div class="card">
               <b>{{item.title}}</b><br/><small>{{item.prompt}}</small><br/>
@@ -759,6 +964,8 @@ def target_dashboard():
         existing=existing,
         existing_by_item=existing_by_item,
         result=result,
+        evaluatee=evaluatee,
+        notice=notice,
         decision_labels=DECISION_LABELS,
     )
 
@@ -768,6 +975,55 @@ def download_upload(filename):
     if not current_user():
         abort(403)
     return send_from_directory(UPLOAD_DIR, filename, as_attachment=False)
+
+
+def can_access_evaluatee_file(user, evaluatee):
+    if not user or not evaluatee:
+        return False
+    if user["role"] == "admin":
+        return True
+    if user["role"] == "target":
+        return evaluatee["user_id"] == user["id"]
+    if user["role"] == "evaluator":
+        row = get_db().execute(
+            "SELECT 1 FROM evaluator_assignments WHERE evaluatee_id=? AND evaluator_user_id=?",
+            (evaluatee["id"], user["id"]),
+        ).fetchone()
+        return bool(row)
+    return False
+
+
+@app.route("/presentation/<int:evaluatee_id>")
+def presentation_file(evaluatee_id):
+    user = current_user()
+    if not user:
+        abort(403)
+    db = get_db()
+    evaluatee = db.execute("SELECT * FROM evaluatees WHERE id=?", (evaluatee_id,)).fetchone()
+    if not evaluatee or not can_access_evaluatee_file(user, evaluatee):
+        abort(403)
+    if not evaluatee["presentation_filename"]:
+        abort(404)
+    storage = evaluatee["presentation_storage"] or "local"
+    if storage == "s3" and evaluatee["presentation_file_id"]:
+        mime, content = download_from_object_storage(evaluatee["presentation_file_id"])
+        if content is None:
+            abort(404)
+        return Response(
+            content,
+            mimetype=mime,
+            headers={"Content-Disposition": f'inline; filename="{evaluatee["presentation_filename"]}"'},
+        )
+    if storage == "gdrive" and evaluatee["presentation_file_id"]:
+        name, mime, content = download_from_google_drive(evaluatee["presentation_file_id"])
+        if content is None:
+            abort(404)
+        return Response(
+            content,
+            mimetype=mime,
+            headers={"Content-Disposition": f'inline; filename="{name or evaluatee["presentation_filename"]}"'},
+        )
+    return send_from_directory(UPLOAD_DIR, evaluatee["presentation_filename"], as_attachment=False)
 
 
 @app.route("/evaluator", methods=["GET", "POST"])
@@ -868,7 +1124,7 @@ def evaluator_dashboard():
         <ul>{% for a in assignments %}<li><a href="{{url_for('evaluator_dashboard', evaluatee_id=a.evaluatee_id)}}">{{a.target_name}}</a></li>{% endfor %}</ul>
         {% if detail %}
           <h3>{{detail.target_name}}</h3>
-          <p>PT \ud30c\uc77c: {% if detail.presentation_filename %}<a href="{{url_for('download_upload', filename=detail.presentation_filename)}}">{{detail.presentation_filename}}</a>{% else %}\ubbf8\uc5c5\ub85c\ub4dc{% endif %}</p>
+          <p>PT \ud30c\uc77c: {% if detail.presentation_filename %}<a href="{{url_for('presentation_file', evaluatee_id=detail.id)}}">{{detail.presentation_filename}}</a>{% else %}\ubbf8\uc5c5\ub85c\ub4dc{% endif %}</p>
           <p>\ub3d9\ub8cc\ud3c9\uac00 \ucde8\ud569: {{peer_summary}}</p>
           <h4>\uc790\uac00\ud3c9\uac00 \uc870\ud68c</h4>
           {% for s in self_data %}
@@ -937,11 +1193,17 @@ def peer_survey(token):
         "SELECT e.id, u.name AS target_name FROM evaluatees e JOIN users u ON u.id=e.user_id WHERE e.peer_survey_token=?",
         (token,),
     ).fetchone()
+    peers = db.execute("SELECT id, name FROM peer_reviewers ORDER BY id").fetchall()
     if not evaluatee:
         abort(404)
     if request.method == "POST":
         comment = request.form.get("peer_comment", "").strip()
+        peer_id = request.form.get("peer_id", "").strip()
         peer_name = request.form.get("peer_name", "").strip()
+        if peer_id:
+            peer_row = db.execute("SELECT name FROM peer_reviewers WHERE id=?", (peer_id,)).fetchone()
+            if peer_row:
+                peer_name = peer_row["name"]
         if comment:
             db.execute(
                 "INSERT INTO peer_surveys(evaluatee_id,peer_name,peer_comment,created_at) VALUES (?,?,?,?)",
@@ -954,12 +1216,20 @@ def peer_survey(token):
         <h2>\ub3d9\ub8cc \ud3c9\uac00 \uc124\ubb38</h2>
         <p>\ub300\uc0c1\uc790: {{evaluatee.target_name}}</p>
         <form method="post">
-          <label>\uc774\ub984 (\uc120\ud0dd)</label><br/><input type="text" name="peer_name"/><br/>
+          <label>\ub3d9\ub8cc\ud3c9\uac00\uc790 \uc120\ud0dd</label><br/>
+          <select name="peer_id">
+            <option value="">-- \uc120\ud0dd --</option>
+            {% for p in peers %}
+              <option value="{{p.id}}">{{p.name}}</option>
+            {% endfor %}
+          </select><br/><br/>
+          <label>\uc9c1\uc811 \uc785\ub825(\uc120\ud0dd)</label><br/><input type="text" name="peer_name"/><br/>
           <label>\uc758\uacac</label><br/><textarea name="peer_comment" rows="6" required></textarea><br/>
           <button type="submit">\uc81c\ucd9c</button>
         </form>
         """ + FOOTER,
         evaluatee=evaluatee,
+        peers=peers,
     )
 
 
@@ -1033,10 +1303,22 @@ def manage_users():
             name = request.form.get("name", "").strip()
             email = request.form.get("email", "").strip()
             role = request.form.get("role", "target")
+            password = request.form.get("password", "").strip()
             if name and email and role in ("admin", "target", "evaluator"):
+                if not password:
+                    password = "target1234" if role == "target" else ("leader1234" if role == "evaluator" else "admin1234")
                 db.execute(
-                    "INSERT INTO users(name, email, role) VALUES (?, ?, ?)",
-                    (name, email, role),
+                    "INSERT INTO users(name, email, role, password_hash) VALUES (?, ?, ?, ?)",
+                    (name, email, role, generate_password_hash(password)),
+                )
+                db.commit()
+        elif action == "reset_password":
+            user_id = request.form.get("user_id")
+            new_password = request.form.get("new_password", "").strip()
+            if user_id and new_password:
+                db.execute(
+                    "UPDATE users SET password_hash=? WHERE id=?",
+                    (generate_password_hash(new_password), user_id),
                 )
                 db.commit()
         elif action == "delete":
@@ -1060,15 +1342,24 @@ def manage_users():
             <option value="evaluator">\ud3c9\uac00\uc790</option>
             <option value="admin">\uad00\ub9ac\uc790</option>
           </select>
+          <label>\ucd08\uae30 \ube44\ubc00\ubc88\ud638</label> <input type="text" name="password" placeholder="\ubbf8\uc785\ub825 \uc2dc \uc5ed\ud560\ubcc4 \uae30\ubcf8\uac12"/>
           <button type="submit">\ucd94\uac00</button>
         </form>
         <h3>\uc0ac\uc6a9\uc790 \ubaa9\ub85d</h3>
         <table>
-          <tr><th>ID</th><th>\uc774\ub984</th><th>Email</th><th>\uc5ed\ud560</th><th>\uc561\uc158</th></tr>
+          <tr><th>ID</th><th>\uc774\ub984</th><th>Email</th><th>\uc5ed\ud560</th><th>\ube44\ubc00\ubc88\ud638 \uc7ac\uc124\uc815</th><th>\uc561\uc158</th></tr>
           {% for u in users %}
           <tr>
             <td>{{u.id}}</td><td>{{u.name}}</td><td>{{u.email}}</td>
             <td>{% if u.role=='admin' %}\uad00\ub9ac\uc790{% elif u.role=='target' %}\ud3c9\uac00\ub300\uc0c1\uc790{% else %}\ud3c9\uac00\uc790{% endif %}</td>
+            <td>
+              <form method="post" style="display:inline">
+                <input type="hidden" name="action" value="reset_password"/>
+                <input type="hidden" name="user_id" value="{{u.id}}"/>
+                <input type="text" name="new_password" placeholder="\uc0c8 \ube44\ubc00\ubc88\ud638" required/>
+                <button type="submit">\ubcc0\uacbd</button>
+              </form>
+            </td>
             <td>
               <form method="post" style="display:inline">
                 <input type="hidden" name="action" value="delete"/>
@@ -1136,6 +1427,53 @@ def manage_cycles():
         </table>
         """ + FOOTER,
         cycles=cycles,
+    )
+
+
+@app.route("/admin/peers", methods=["GET", "POST"])
+@require_role("admin")
+def manage_peers():
+    db = get_db()
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "add":
+            name = request.form.get("name", "").strip()
+            if name:
+                db.execute("INSERT INTO peer_reviewers(name) VALUES (?) ON CONFLICT(name) DO NOTHING", (name,))
+                db.commit()
+        elif action == "delete":
+            peer_id = request.form.get("peer_id")
+            if peer_id:
+                db.execute("DELETE FROM peer_reviewers WHERE id=?", (peer_id,))
+                db.commit()
+        return redirect(url_for("manage_peers"))
+    peers = db.execute("SELECT * FROM peer_reviewers ORDER BY id").fetchall()
+    return render_template_string(
+        COMMON_STYLE + NAV_ADMIN + """
+        <h2>\ub3d9\ub8cc\ud3c9\uac00\uc790 \uad00\ub9ac</h2>
+        <form method="post">
+          <input type="hidden" name="action" value="add"/>
+          <label>\uc774\ub984</label> <input type="text" name="name" required/>
+          <button type="submit">\ucd94\uac00</button>
+        </form>
+        <h3>\ub3d9\ub8cc\ud3c9\uac00\uc790 \ubaa9\ub85d</h3>
+        <table>
+          <tr><th>ID</th><th>\uc774\ub984</th><th>\uc561\uc158</th></tr>
+          {% for p in peers %}
+          <tr>
+            <td>{{p.id}}</td><td>{{p.name}}</td>
+            <td>
+              <form method="post" style="display:inline">
+                <input type="hidden" name="action" value="delete"/>
+                <input type="hidden" name="peer_id" value="{{p.id}}"/>
+                <button type="submit" onclick="return confirm('\uc0ad\uc81c\ud558\uc2dc\uaca0\uc2b5\ub2c8\uae4c?')">\uc0ad\uc81c</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </table>
+        """ + FOOTER,
+        peers=peers,
     )
 
 
