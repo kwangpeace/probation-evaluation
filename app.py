@@ -297,6 +297,10 @@ def init_db():
             id SERIAL PRIMARY KEY, evaluatee_id INTEGER NOT NULL, peer_name TEXT,
             peer_comment TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS peer_feedback_assignments (
+            id SERIAL PRIMARY KEY, evaluatee_id INTEGER NOT NULL, peer_reviewer_id INTEGER NOT NULL,
+            UNIQUE(evaluatee_id, peer_reviewer_id)
+        );
         CREATE TABLE IF NOT EXISTS aggregated_results (
             id SERIAL PRIMARY KEY, evaluatee_id INTEGER NOT NULL UNIQUE,
             decision TEXT NOT NULL, summary TEXT NOT NULL, admin_feedback TEXT,
@@ -354,6 +358,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS peer_surveys (
             id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER NOT NULL, peer_name TEXT,
             peer_comment TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS peer_feedback_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER NOT NULL, peer_reviewer_id INTEGER NOT NULL,
+            UNIQUE(evaluatee_id, peer_reviewer_id)
         );
         CREATE TABLE IF NOT EXISTS aggregated_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER NOT NULL UNIQUE,
@@ -434,7 +442,7 @@ def init_db():
         )
     db.execute("INSERT INTO app_settings(key, value) VALUES ('peer_visibility', 'evaluator_only') ON CONFLICT(key) DO NOTHING")
     if scalar_count(db, "peer_reviewers") == 0:
-        db.executemany("INSERT INTO peer_reviewers(name) VALUES (?)", [("동료평가자 김동료",), ("동료평가자 이동료",), ("동료평가자 박동료",)])
+        db.executemany("INSERT INTO peer_reviewers(name) VALUES (?)", [("동료피드백 참여자 김동료",), ("동료피드백 참여자 이동료",), ("동료피드백 참여자 박동료",)])
     db.commit()
     db.close()
 
@@ -585,6 +593,19 @@ def get_audit_logs_for_evaluatee(db, evaluatee_id, limit=20):
         LIMIT ?
         """,
         (evaluatee_id, limit),
+    ).fetchall()
+
+
+def get_assigned_peer_reviewers(db, evaluatee_id):
+    return db.execute(
+        """
+        SELECT pr.id, pr.name
+        FROM peer_feedback_assignments pfa
+        JOIN peer_reviewers pr ON pr.id = pfa.peer_reviewer_id
+        WHERE pfa.evaluatee_id=?
+        ORDER BY pr.name
+        """,
+        (evaluatee_id,),
     ).fetchall()
 
 
@@ -799,7 +820,7 @@ NAV_ADMIN = """<nav>
   <a href="/admin">대시보드</a>
   <a href="/admin/users">사용자</a>
   <a href="/admin/cycles">사이클</a>
-  <a href="/admin/peers">동료평가자</a>
+  <a href="/admin/peers">동료피드백 참여자</a>
 </div>
 <div class="nav-right"><a href="/logout">로그아웃</a></div>
 </nav>"""
@@ -900,6 +921,7 @@ def admin_dashboard():
         target_user_id = request.form.get("target_user_id")
         cycle_id = request.form.get("cycle_id")
         evaluator_ids = request.form.getlist("evaluator_ids")[:3]
+        peer_reviewer_ids = request.form.getlist("peer_reviewer_ids")
         cursor = db.execute("INSERT INTO evaluatees(user_id,cycle_id,peer_survey_token,created_at) VALUES (?,?,?,?) RETURNING id",
                             (target_user_id, cycle_id, secrets.token_hex(8), now()))
         inserted = cursor.fetchone()
@@ -910,20 +932,29 @@ def admin_dashboard():
                 rel = "direct_leader"
             db.execute("INSERT INTO evaluator_assignments(evaluatee_id,evaluator_user_id,relationship) VALUES (?,?,?) ON CONFLICT(evaluatee_id,evaluator_user_id) DO UPDATE SET relationship=excluded.relationship",
                        (evaluatee_id, evaluator_id, rel))
+        for peer_reviewer_id in peer_reviewer_ids:
+            db.execute(
+                "INSERT INTO peer_feedback_assignments(evaluatee_id,peer_reviewer_id) VALUES (?,?) ON CONFLICT(evaluatee_id,peer_reviewer_id) DO NOTHING",
+                (evaluatee_id, peer_reviewer_id),
+            )
         log_action(db, "assignment_created", evaluatee_id=evaluatee_id, actor_user_id=current_user()["id"], detail=f"평가자 {len(evaluator_ids)}명 배정")
         db.commit()
         return redirect(url_for("admin_dashboard"))
 
     targets = db.execute("SELECT * FROM users WHERE role='target' ORDER BY id").fetchall()
     evaluators = db.execute("SELECT * FROM users WHERE role='evaluator' ORDER BY id").fetchall()
+    peer_reviewers = db.execute("SELECT * FROM peer_reviewers ORDER BY name").fetchall()
     cycles = db.execute("SELECT * FROM evaluation_cycles ORDER BY id DESC").fetchall()
     peer_visibility = get_peer_visibility(db)
     evaluatees = db.execute("""
         SELECT e.id, u.name AS target_name, u.team AS target_team, c.name AS cycle_name,
-               e.peer_survey_token, e.presentation_filename, ar.decision, e.self_submitted_at
+               e.peer_survey_token, e.presentation_filename, ar.decision, e.self_submitted_at,
+               COUNT(DISTINCT pfa.peer_reviewer_id) AS peer_feedback_count
         FROM evaluatees e JOIN users u ON u.id = e.user_id
         JOIN evaluation_cycles c ON c.id = e.cycle_id
         LEFT JOIN aggregated_results ar ON ar.evaluatee_id = e.id
+        LEFT JOIN peer_feedback_assignments pfa ON pfa.evaluatee_id = e.id
+        GROUP BY e.id, u.name, u.team, c.name, e.peer_survey_token, e.presentation_filename, ar.decision, e.self_submitted_at
         ORDER BY e.id DESC
     """).fetchall()
 
@@ -944,7 +975,7 @@ def admin_dashboard():
     </div>
 
     <div class="section">
-      <h3 style="margin-top:0;">동료평가 공개 정책</h3>
+      <h3 style="margin-top:0;">동료피드백 공개 정책</h3>
       <form method="post" class="form-row" style="align-items:end;">
         <input type="hidden" name="form_type" value="policy"/>
         <div class="form-group" style="flex:2;">
@@ -984,6 +1015,16 @@ def admin_dashboard():
           </div>
           {% endfor %}
         </fieldset>
+        <fieldset>
+          <legend>동료피드백 참여자 배정</legend>
+          <div class="form-row">
+            {% for p in peer_reviewers %}
+            <label style="display:flex;align-items:center;gap:6px;font-weight:500;">
+              <input type="checkbox" name="peer_reviewer_ids" value="{{p.id}}"> {{p.name}}
+            </label>
+            {% endfor %}
+          </div>
+        </fieldset>
         <button type="submit" class="btn btn-primary">생성</button>
       </form>
     </div>
@@ -991,7 +1032,7 @@ def admin_dashboard():
     <div class="section">
       <h3 style="margin-top:0;">대상자 목록</h3>
       <table>
-        <tr><th>대상자</th><th>팀</th><th>사이클</th><th>진행 상태</th><th>자가평가</th><th>판정</th><th>동료설문</th><th>액션</th></tr>
+        <tr><th>대상자</th><th>팀</th><th>사이클</th><th>진행 상태</th><th>자가평가</th><th>판정</th><th>동료피드백</th><th>액션</th></tr>
         {% for e in evaluatees %}
         <tr>
           <td><b>{{e.target_name}}</b></td>
@@ -1012,11 +1053,15 @@ def admin_dashboard():
               {% elif d == 'EXTENSION' %}<span class="badge badge-warning">{{dl[d]}}</span>
               {% elif d == 'FAIL' %}<span class="badge badge-danger">{{dl[d]}}</span>
               {% else %}<span class="badge badge-gray">{{dl[d]}}</span>{% endif %}</td>
-          <td><a href="{{url_for('peer_survey', token=e.peer_survey_token, _external=True)}}" target="_blank" class="link-copy">링크 열기</a></td>
+          <td>
+            <div><a href="{{url_for('peer_feedback', token=e.peer_survey_token, _external=True)}}" target="_blank" class="link-copy">링크 열기</a></div>
+            <div style="font-size:11px;color:var(--gray-400);margin-top:4px;">배정 {{e.peer_feedback_count}}명</div>
+          </td>
           <td>
             <a href="{{url_for('aggregate_result', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">취합</a>
             <a href="{{url_for('deliver_feedback', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">전달</a>
             <a href="{{url_for('admin_report', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">리포트</a>
+            <a href="{{url_for('manage_peer_feedback_assignments', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">동료피드백 배정</a>
           </td>
         </tr>
         {% endfor %}
@@ -1026,7 +1071,7 @@ def admin_dashboard():
         evaluatees=evaluatees, peer_visibility=peer_visibility,
         pv_options=PEER_VISIBILITY_OPTIONS, dl=DECISION_LABELS,
         rel_options=RELATIONSHIP_OPTIONS, total=total, submitted=submitted, decided=decided,
-        progress_map=progress_map)
+        progress_map=progress_map, peer_reviewers=peer_reviewers)
 
 
 # ---------------------------------------------------------------------------
@@ -1244,7 +1289,7 @@ def evaluator_dashboard():
     <div class="section">
       <h3 style="margin-top:0;">{{detail.target_name}} <span style="font-weight:400;color:var(--gray-400);">{{detail.target_team or ''}}</span></h3>
       <p style="margin-bottom:12px;">PT 파일: {% if detail.presentation_filename %}<a href="{{url_for('presentation_file', evaluatee_id=detail.id)}}">{{detail.presentation_filename}}</a>{% else %}미업로드{% endif %}</p>
-      <p style="margin-bottom:16px;font-size:13px;color:var(--gray-500);">동료평가 요약: {{peer_summary}}</p>
+      <p style="margin-bottom:16px;font-size:13px;color:var(--gray-500);">동료피드백 요약: {{peer_summary}}</p>
 
       {% if self_data %}
       <h3>자가평가 조회</h3>
@@ -1321,13 +1366,14 @@ def ai_questions(evaluatee_id):
 # Peer survey
 # ---------------------------------------------------------------------------
 
+@app.route("/peer-feedback/<token>", methods=["GET", "POST"])
 @app.route("/peer-survey/<token>", methods=["GET", "POST"])
-def peer_survey(token):
+def peer_feedback(token):
     db = get_db()
     evaluatee = db.execute("SELECT e.id, u.name AS target_name FROM evaluatees e JOIN users u ON u.id=e.user_id WHERE e.peer_survey_token=?", (token,)).fetchone()
-    peers = db.execute("SELECT id, name FROM peer_reviewers ORDER BY id").fetchall()
     if not evaluatee:
         abort(404)
+    peers = get_assigned_peer_reviewers(db, evaluatee["id"])
     if request.method == "POST":
         comment = request.form.get("peer_comment", "").strip()
         peer_id = request.form.get("peer_id", "").strip()
@@ -1338,34 +1384,35 @@ def peer_survey(token):
                 peer_name = peer_row["name"]
         if comment:
             db.execute("INSERT INTO peer_surveys(evaluatee_id,peer_name,peer_comment,created_at) VALUES (?,?,?,?)", (evaluatee["id"], peer_name, comment, now()))
-            log_action(db, "peer_survey_submitted", evaluatee_id=evaluatee["id"], actor_user_id=None, detail=f"동료 평가 제출: {peer_name or '익명'}")
+            log_action(db, "peer_feedback_submitted", evaluatee_id=evaluatee["id"], actor_user_id=None, detail=f"동료피드백 제출: {peer_name or '익명'}")
             db.commit()
             return render_template_string(COMMON_STYLE + """
             <div style="text-align:center;margin-top:80px;">
               <div style="font-size:48px;margin-bottom:16px;">✅</div>
               <h2 style="border:none;">제출 완료</h2>
-              <p class="subtitle">동료 평가 의견이 성공적으로 제출되었습니다.</p>
+              <p class="subtitle">동료피드백이 성공적으로 제출되었습니다.</p>
             </div>""" + FOOTER)
     return render_template_string(COMMON_STYLE + """
     <div style="max-width:600px;margin:40px auto;">
       <div class="section">
-        <h2 style="margin-bottom:4px;">동료 평가 설문</h2>
+        <h2 style="margin-bottom:4px;">동료피드백 작성</h2>
         <p class="subtitle">대상자: <b>{{evaluatee.target_name}}</b></p>
         <form method="post">
           <div class="form-group">
-            <label>동료평가자 선택</label>
+            <label>동료피드백 참여자 선택</label>
             <select name="peer_id">
               <option value="">-- 선택 --</option>
               {% for p in peers %}<option value="{{p.id}}">{{p.name}}</option>{% endfor %}
             </select>
+            {% if not peers %}<p style="font-size:12px;color:var(--warning);margin-top:6px;">아직 배정된 동료피드백 참여자가 없습니다. 관리자에게 배정을 요청해주세요.</p>{% endif %}
           </div>
           <div class="form-group">
             <label>직접 입력 (선택)</label>
             <input type="text" name="peer_name" placeholder="이름"/>
           </div>
           <div class="form-group">
-            <label>의견</label>
-            <textarea name="peer_comment" rows="6" required placeholder="대상자에 대한 의견을 자유롭게 작성해주세요."></textarea>
+            <label>피드백</label>
+            <textarea name="peer_comment" rows="6" required placeholder="대상자에 대한 피드백을 자유롭게 작성해주세요."></textarea>
           </div>
           <button type="submit" class="btn btn-primary" style="width:100%;">제출</button>
         </form>
@@ -1633,7 +1680,7 @@ def admin_report(evaluatee_id):
     </div>
 
     <div class="section">
-      <h3 style="margin-top:0;">동료 평가</h3>
+      <h3 style="margin-top:0;">동료피드백</h3>
       {% for ps in peer_surveys %}
       <div class="card"><b>{{ps.peer_name or '익명'}}</b><p style="margin-top:4px;">{{ps.peer_comment}}</p></div>
       {% endfor %}
@@ -1675,6 +1722,72 @@ def admin_report(evaluatee_id):
         leader_rows=leader_rows, peer_surveys=peer_surveys, result=result,
         item_grades=item_grades, evaluators_info=evaluators_info, progress=progress, timeline=timeline,
         dl=DECISION_LABELS, rel_labels=RELATIONSHIP_OPTIONS, now=now())
+
+
+@app.route("/admin/peer-feedback/<int:evaluatee_id>", methods=["GET", "POST"])
+@require_role("admin")
+def manage_peer_feedback_assignments(evaluatee_id):
+    db = get_db()
+    evaluatee = db.execute(
+        """
+        SELECT e.id, u.name AS target_name, u.team AS target_team, c.name AS cycle_name
+        FROM evaluatees e
+        JOIN users u ON u.id = e.user_id
+        JOIN evaluation_cycles c ON c.id = e.cycle_id
+        WHERE e.id=?
+        """,
+        (evaluatee_id,),
+    ).fetchone()
+    if not evaluatee:
+        abort(404)
+    peer_reviewers = db.execute("SELECT * FROM peer_reviewers ORDER BY name").fetchall()
+    if request.method == "POST":
+        selected_ids = set(request.form.getlist("peer_reviewer_ids"))
+        db.execute("DELETE FROM peer_feedback_assignments WHERE evaluatee_id=?", (evaluatee_id,))
+        for peer in peer_reviewers:
+            if str(peer["id"]) in selected_ids:
+                db.execute(
+                    "INSERT INTO peer_feedback_assignments(evaluatee_id,peer_reviewer_id) VALUES (?,?)",
+                    (evaluatee_id, peer["id"]),
+                )
+        actor = current_user()
+        log_action(
+            db,
+            "peer_feedback_assignment_updated",
+            evaluatee_id=evaluatee_id,
+            actor_user_id=actor["id"] if actor else None,
+            detail=f"배정 인원 {len(selected_ids)}명",
+        )
+        db.commit()
+        return redirect(url_for("manage_peer_feedback_assignments", evaluatee_id=evaluatee_id))
+    assigned = {row["id"] for row in get_assigned_peer_reviewers(db, evaluatee_id)}
+    return render_template_string(
+        COMMON_STYLE + NAV_ADMIN + """
+        <h1>동료피드백 참여자 배정</h1>
+        <p class="subtitle">{{evaluatee.target_name}} · {{evaluatee.target_team or '-'}} · {{evaluatee.cycle_name}}</p>
+
+        <div class="section">
+          <h3 style="margin-top:0;">배정할 참여자 선택</h3>
+          <form method="post">
+            <div class="form-row">
+              {% for p in peer_reviewers %}
+              <label style="display:flex;align-items:center;gap:8px;font-weight:500;">
+                <input type="checkbox" name="peer_reviewer_ids" value="{{p.id}}" {% if p.id in assigned %}checked{% endif %}>
+                {{p.name}}
+              </label>
+              {% endfor %}
+            </div>
+            <div style="margin-top:16px;">
+              <button type="submit" class="btn btn-primary">배정 저장</button>
+              <a href="{{url_for('admin_dashboard')}}" class="btn btn-outline" style="margin-left:8px;">돌아가기</a>
+            </div>
+          </form>
+        </div>
+        """,
+        evaluatee=evaluatee,
+        peer_reviewers=peer_reviewers,
+        assigned=assigned,
+    ) + FOOTER
 
 
 # ---------------------------------------------------------------------------
@@ -1868,7 +1981,7 @@ def manage_peers():
         return redirect(url_for("manage_peers"))
     peers = db.execute("SELECT * FROM peer_reviewers ORDER BY id").fetchall()
     return render_template_string(COMMON_STYLE + NAV_ADMIN + """
-    <h1>동료평가자 관리</h1>
+    <h1>동료피드백 참여자 관리</h1>
     <div class="section">
       <form method="post" class="form-row" style="align-items:end;">
         <input type="hidden" name="action" value="add"/>
