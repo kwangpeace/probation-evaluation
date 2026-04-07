@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 import os
+import json
 import secrets
 import sqlite3
 from io import BytesIO
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 import requests
@@ -55,15 +56,37 @@ _object_storage_client = None
 GRADE_TO_SCORE = {"S": 4, "A": 3, "B": 2, "C": 1}
 SCORE_TO_GRADE = {4: "S", 3: "A", 2: "B", 1: "C"}
 PEER_VISIBILITY_OPTIONS = {
-    "evaluator_only": "\ud3c9\uac00\uc790\ub9cc \uacf5\uac1c",
-    "admin_only": "\uad00\ub9ac\uc790\ub9cc \uacf5\uac1c",
-    "admin_and_evaluator": "\uad00\ub9ac\uc790+\ud3c9\uac00\uc790 \uacf5\uac1c",
+    "evaluator_only": "평가자만 공개",
+    "admin_only": "관리자만 공개",
+    "admin_and_evaluator": "관리자+평가자 공개",
+}
+RELATIONSHIP_OPTIONS = {
+    "direct_leader": "직속 리더",
+    "other_leader": "타팀 리더",
+    "mentor": "멘토",
+    "hr": "HR 담당자",
+    "other": "기타",
+}
+DECISION_LABELS = {
+    "SUPER_PASS": "합격 (핵심인재)",
+    "PASS": "합격 (우수인재)",
+    "EXTENSION": "수습 연장",
+    "FAIL": "불합격",
+    "IN_PROGRESS": "진행 중",
 }
 
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
 
+
+def today_str():
+    return date.today().isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
 
 class DBWrapper:
     def __init__(self, conn, is_postgres=False):
@@ -107,6 +130,34 @@ def connect_db():
     return DBWrapper(conn, is_postgres=False)
 
 
+def get_db():
+    if "db" not in g:
+        g.db = connect_db()
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def scalar_count(db, table_name):
+    row = db.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
+    if row is None:
+        return 0
+    if isinstance(row, dict):
+        return int(row.get("count", 0))
+    if hasattr(row, "keys") and "count" in row.keys():
+        return int(row["count"])
+    return int(row[0])
+
+
+# ---------------------------------------------------------------------------
+# Storage helpers
+# ---------------------------------------------------------------------------
+
 def get_drive_service():
     global _drive_service
     if not GOOGLE_DRIVE_ENABLED:
@@ -119,8 +170,6 @@ def get_drive_service():
     cred_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     scopes = ["https://www.googleapis.com/auth/drive"]
     if raw_json:
-        import json
-
         info = json.loads(raw_json)
         creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
     elif cred_file:
@@ -180,343 +229,204 @@ def upload_to_object_storage(object_key, file_bytes, content_type):
     client = get_object_storage_client()
     if client is None:
         return False
-    client.put_object(
-        Bucket=OBJECT_STORAGE_BUCKET,
-        Key=object_key,
-        Body=file_bytes,
-        ContentType=content_type or "application/octet-stream",
-    )
-    return True
+    try:
+        client.put_object(Bucket=OBJECT_STORAGE_BUCKET, Key=object_key, Body=file_bytes, ContentType=content_type or "application/octet-stream")
+        return True
+    except Exception as exc:
+        app.logger.exception("Object storage upload failed: %s", exc)
+        return False
 
 
 def download_from_object_storage(object_key):
     client = get_object_storage_client()
     if client is None or not object_key:
         return None, None
-    resp = client.get_object(Bucket=OBJECT_STORAGE_BUCKET, Key=object_key)
-    return resp.get("ContentType") or "application/octet-stream", resp["Body"].read()
+    try:
+        resp = client.get_object(Bucket=OBJECT_STORAGE_BUCKET, Key=object_key)
+        return resp.get("ContentType") or "application/octet-stream", resp["Body"].read()
+    except Exception as exc:
+        app.logger.exception("Object storage download failed: %s", exc)
+        return None, None
 
 
-def scalar_count(db, table_name):
-    row = db.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
-    if row is None:
-        return 0
-    if isinstance(row, dict):
-        return int(row.get("count", 0))
-    if hasattr(row, "keys") and "count" in row.keys():
-        return int(row["count"])
-    return int(row[0])
-
-
-def get_db():
-    if "db" not in g:
-        g.db = connect_db()
-    return g.db
-
-
-@app.teardown_appcontext
-def close_db(exception):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
-
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
 
 def init_db():
     db = connect_db()
     if USE_POSTGRES:
         schema_script = """
         CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            role TEXT NOT NULL CHECK (role IN ('admin', 'target', 'evaluator'))
+            id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+            role TEXT NOT NULL CHECK (role IN ('admin','target','evaluator')),
+            password_hash TEXT, team TEXT, access_start TEXT, access_end TEXT
         );
         CREATE TABLE IF NOT EXISTS evaluation_cycles (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            start_date TEXT,
-            end_date TEXT,
+            id SERIAL PRIMARY KEY, name TEXT NOT NULL, start_date TEXT, end_date TEXT,
             status TEXT NOT NULL DEFAULT 'active'
         );
         CREATE TABLE IF NOT EXISTS evaluatees (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            cycle_id INTEGER NOT NULL,
-            peer_survey_token TEXT NOT NULL UNIQUE,
-            presentation_filename TEXT,
-            presentation_file_id TEXT,
-            presentation_storage TEXT NOT NULL DEFAULT 'local',
-            self_submitted_at TEXT,
-            created_at TEXT NOT NULL
+            id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL, cycle_id INTEGER NOT NULL,
+            peer_survey_token TEXT NOT NULL UNIQUE, presentation_filename TEXT,
+            presentation_file_id TEXT, presentation_storage TEXT NOT NULL DEFAULT 'local',
+            self_submitted_at TEXT, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS evaluator_assignments (
-            id SERIAL PRIMARY KEY,
-            evaluatee_id INTEGER NOT NULL,
-            evaluator_user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY, evaluatee_id INTEGER NOT NULL, evaluator_user_id INTEGER NOT NULL,
+            relationship TEXT NOT NULL DEFAULT 'direct_leader',
             UNIQUE(evaluatee_id, evaluator_user_id)
         );
         CREATE TABLE IF NOT EXISTS assessment_items (
-            id SERIAL PRIMARY KEY,
-            code TEXT NOT NULL UNIQUE,
-            title TEXT NOT NULL,
-            prompt TEXT NOT NULL,
-            grade_s TEXT NOT NULL,
-            grade_a TEXT NOT NULL,
-            grade_b TEXT NOT NULL,
-            grade_c TEXT NOT NULL
+            id SERIAL PRIMARY KEY, code TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+            prompt TEXT NOT NULL, grade_s TEXT NOT NULL, grade_a TEXT NOT NULL,
+            grade_b TEXT NOT NULL, grade_c TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS self_assessments (
-            id SERIAL PRIMARY KEY,
-            evaluatee_id INTEGER NOT NULL,
-            item_id INTEGER NOT NULL,
-            grade TEXT NOT NULL,
-            keep_text TEXT,
-            problem_text TEXT,
-            try_text TEXT,
-            updated_at TEXT NOT NULL,
-            UNIQUE(evaluatee_id, item_id)
+            id SERIAL PRIMARY KEY, evaluatee_id INTEGER NOT NULL, item_id INTEGER NOT NULL,
+            grade TEXT NOT NULL, keep_text TEXT, problem_text TEXT, try_text TEXT,
+            updated_at TEXT NOT NULL, UNIQUE(evaluatee_id, item_id)
         );
         CREATE TABLE IF NOT EXISTS leader_assessments (
-            id SERIAL PRIMARY KEY,
-            evaluatee_id INTEGER NOT NULL,
-            evaluator_user_id INTEGER NOT NULL,
-            item_id INTEGER NOT NULL,
-            grade TEXT NOT NULL,
-            feedback_text TEXT,
-            presentation_note TEXT,
-            qa_note TEXT,
-            updated_at TEXT NOT NULL,
+            id SERIAL PRIMARY KEY, evaluatee_id INTEGER NOT NULL, evaluator_user_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL, grade TEXT NOT NULL, feedback_text TEXT,
+            presentation_note TEXT, qa_note TEXT, updated_at TEXT NOT NULL,
             UNIQUE(evaluatee_id, evaluator_user_id, item_id)
         );
         CREATE TABLE IF NOT EXISTS peer_surveys (
-            id SERIAL PRIMARY KEY,
-            evaluatee_id INTEGER NOT NULL,
-            peer_name TEXT,
-            peer_comment TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            id SERIAL PRIMARY KEY, evaluatee_id INTEGER NOT NULL, peer_name TEXT,
+            peer_comment TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS aggregated_results (
-            id SERIAL PRIMARY KEY,
-            evaluatee_id INTEGER NOT NULL UNIQUE,
-            decision TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            admin_feedback TEXT,
-            delivered_at TEXT,
-            updated_at TEXT NOT NULL
+            id SERIAL PRIMARY KEY, evaluatee_id INTEGER NOT NULL UNIQUE,
+            decision TEXT NOT NULL, summary TEXT NOT NULL, admin_feedback TEXT,
+            ai_polished_feedback TEXT, delivered_at TEXT, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS ai_question_logs (
-            id SERIAL PRIMARY KEY,
-            evaluatee_id INTEGER NOT NULL,
-            evaluator_user_id INTEGER NOT NULL,
-            source_note TEXT NOT NULL,
-            suggested_questions TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            id SERIAL PRIMARY KEY, evaluatee_id INTEGER NOT NULL, evaluator_user_id INTEGER NOT NULL,
+            source_note TEXT NOT NULL, suggested_questions TEXT NOT NULL, created_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS app_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS peer_reviewers (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL UNIQUE
-        );
+        CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS peer_reviewers (id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE);
         """
     else:
         schema_script = """
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            role TEXT NOT NULL CHECK (role IN ('admin', 'target', 'evaluator'))
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+            role TEXT NOT NULL CHECK (role IN ('admin','target','evaluator')),
+            password_hash TEXT, team TEXT, access_start TEXT, access_end TEXT
         );
         CREATE TABLE IF NOT EXISTS evaluation_cycles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            start_date TEXT,
-            end_date TEXT,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, start_date TEXT, end_date TEXT,
             status TEXT NOT NULL DEFAULT 'active'
         );
         CREATE TABLE IF NOT EXISTS evaluatees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            cycle_id INTEGER NOT NULL,
-            peer_survey_token TEXT NOT NULL UNIQUE,
-            presentation_filename TEXT,
-            presentation_file_id TEXT,
-            presentation_storage TEXT NOT NULL DEFAULT 'local',
-            self_submitted_at TEXT,
-            created_at TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, cycle_id INTEGER NOT NULL,
+            peer_survey_token TEXT NOT NULL UNIQUE, presentation_filename TEXT,
+            presentation_file_id TEXT, presentation_storage TEXT NOT NULL DEFAULT 'local',
+            self_submitted_at TEXT, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS evaluator_assignments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            evaluatee_id INTEGER NOT NULL,
-            evaluator_user_id INTEGER NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER NOT NULL, evaluator_user_id INTEGER NOT NULL,
+            relationship TEXT NOT NULL DEFAULT 'direct_leader',
             UNIQUE(evaluatee_id, evaluator_user_id)
         );
         CREATE TABLE IF NOT EXISTS assessment_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT NOT NULL UNIQUE,
-            title TEXT NOT NULL,
-            prompt TEXT NOT NULL,
-            grade_s TEXT NOT NULL,
-            grade_a TEXT NOT NULL,
-            grade_b TEXT NOT NULL,
-            grade_c TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE, title TEXT NOT NULL,
+            prompt TEXT NOT NULL, grade_s TEXT NOT NULL, grade_a TEXT NOT NULL,
+            grade_b TEXT NOT NULL, grade_c TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS self_assessments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            evaluatee_id INTEGER NOT NULL,
-            item_id INTEGER NOT NULL,
-            grade TEXT NOT NULL,
-            keep_text TEXT,
-            problem_text TEXT,
-            try_text TEXT,
-            updated_at TEXT NOT NULL,
-            UNIQUE(evaluatee_id, item_id)
+            id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER NOT NULL, item_id INTEGER NOT NULL,
+            grade TEXT NOT NULL, keep_text TEXT, problem_text TEXT, try_text TEXT,
+            updated_at TEXT NOT NULL, UNIQUE(evaluatee_id, item_id)
         );
         CREATE TABLE IF NOT EXISTS leader_assessments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            evaluatee_id INTEGER NOT NULL,
-            evaluator_user_id INTEGER NOT NULL,
-            item_id INTEGER NOT NULL,
-            grade TEXT NOT NULL,
-            feedback_text TEXT,
-            presentation_note TEXT,
-            qa_note TEXT,
-            updated_at TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER NOT NULL, evaluator_user_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL, grade TEXT NOT NULL, feedback_text TEXT,
+            presentation_note TEXT, qa_note TEXT, updated_at TEXT NOT NULL,
             UNIQUE(evaluatee_id, evaluator_user_id, item_id)
         );
         CREATE TABLE IF NOT EXISTS peer_surveys (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            evaluatee_id INTEGER NOT NULL,
-            peer_name TEXT,
-            peer_comment TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER NOT NULL, peer_name TEXT,
+            peer_comment TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS aggregated_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            evaluatee_id INTEGER NOT NULL UNIQUE,
-            decision TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            admin_feedback TEXT,
-            delivered_at TEXT,
-            updated_at TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER NOT NULL UNIQUE,
+            decision TEXT NOT NULL, summary TEXT NOT NULL, admin_feedback TEXT,
+            ai_polished_feedback TEXT, delivered_at TEXT, updated_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS ai_question_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            evaluatee_id INTEGER NOT NULL,
-            evaluator_user_id INTEGER NOT NULL,
-            source_note TEXT NOT NULL,
-            suggested_questions TEXT NOT NULL,
-            created_at TEXT NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER NOT NULL, evaluator_user_id INTEGER NOT NULL,
+            source_note TEXT NOT NULL, suggested_questions TEXT NOT NULL, created_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS app_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS peer_reviewers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE
-        );
+        CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS peer_reviewers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
         """
     db.executescript(schema_script)
-    # Runtime-safe migrations for existing databases.
+
     if USE_POSTGRES:
-        db.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
+        for col, typ in [("password_hash", "TEXT"), ("team", "TEXT"), ("access_start", "TEXT"), ("access_end", "TEXT")]:
+            db.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {typ}")
         db.execute("ALTER TABLE evaluatees ADD COLUMN IF NOT EXISTS presentation_file_id TEXT")
         db.execute("ALTER TABLE evaluatees ADD COLUMN IF NOT EXISTS presentation_storage TEXT NOT NULL DEFAULT 'local'")
+        db.execute("ALTER TABLE evaluator_assignments ADD COLUMN IF NOT EXISTS relationship TEXT NOT NULL DEFAULT 'direct_leader'")
+        db.execute("ALTER TABLE aggregated_results ADD COLUMN IF NOT EXISTS ai_polished_feedback TEXT")
     else:
-        user_cols = db.execute("PRAGMA table_info(users)").fetchall()
-        user_col_names = {c["name"] if hasattr(c, "keys") else c[1] for c in user_cols}
-        if "password_hash" not in user_col_names:
-            db.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
-        eval_cols = db.execute("PRAGMA table_info(evaluatees)").fetchall()
-        eval_col_names = {c["name"] if hasattr(c, "keys") else c[1] for c in eval_cols}
-        if "presentation_file_id" not in eval_col_names:
-            db.execute("ALTER TABLE evaluatees ADD COLUMN presentation_file_id TEXT")
-        if "presentation_storage" not in eval_col_names:
-            db.execute("ALTER TABLE evaluatees ADD COLUMN presentation_storage TEXT NOT NULL DEFAULT 'local'")
+        def _add_col_if_missing(table, col, typ):
+            cols = db.execute(f"PRAGMA table_info({table})").fetchall()
+            names = {c["name"] if hasattr(c, "keys") else c[1] for c in cols}
+            if col not in names:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        for col, typ in [("password_hash", "TEXT"), ("team", "TEXT"), ("access_start", "TEXT"), ("access_end", "TEXT")]:
+            _add_col_if_missing("users", col, typ)
+        _add_col_if_missing("evaluatees", "presentation_file_id", "TEXT")
+        _add_col_if_missing("evaluatees", "presentation_storage", "TEXT NOT NULL DEFAULT 'local'")
+        _add_col_if_missing("evaluator_assignments", "relationship", "TEXT NOT NULL DEFAULT 'direct_leader'")
+        _add_col_if_missing("aggregated_results", "ai_polished_feedback", "TEXT")
 
     if scalar_count(db, "users") == 0:
         db.executemany(
-            "INSERT INTO users(name, email, role, password_hash) VALUES (?, ?, ?, ?)",
+            "INSERT INTO users(name, email, role, password_hash, team) VALUES (?, ?, ?, ?, ?)",
             [
-                ("HR \uad00\ub9ac\uc790", "admin@company.local", "admin", generate_password_hash("admin1234")),
-                ("\ub300\uc0c1\uc790 \uae40\uc218\uc2b5", "target1@company.local", "target", generate_password_hash("target1234")),
-                ("\ub300\uc0c1\uc790 \ubc15\uc218\uc2b5", "target2@company.local", "target", generate_password_hash("target1234")),
-                ("\ud3c9\uac00\uc790 \uc774\ub9ac\ub354", "leader1@company.local", "evaluator", generate_password_hash("leader1234")),
-                ("\ud3c9\uac00\uc790 \ucd5c\ub9ac\ub354", "leader2@company.local", "evaluator", generate_password_hash("leader1234")),
-                ("\ud3c9\uac00\uc790 \uc815\ub9ac\ub354", "leader3@company.local", "evaluator", generate_password_hash("leader1234")),
+                ("HR 관리자", "admin@company.local", "admin", generate_password_hash("admin1234"), "인사팀"),
+                ("대상자 김수습", "target1@company.local", "target", generate_password_hash("target1234"), "개발팀"),
+                ("대상자 박수습", "target2@company.local", "target", generate_password_hash("target1234"), "디자인팀"),
+                ("평가자 이리더", "leader1@company.local", "evaluator", generate_password_hash("leader1234"), "개발팀"),
+                ("평가자 최리더", "leader2@company.local", "evaluator", generate_password_hash("leader1234"), "디자인팀"),
+                ("평가자 정리더", "leader3@company.local", "evaluator", generate_password_hash("leader1234"), "기획팀"),
             ],
         )
     else:
-        # Backfill password hash for old rows.
-        db.execute(
-            "UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='admin'",
-            (generate_password_hash("admin1234"),),
-        )
-        db.execute(
-            "UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='target'",
-            (generate_password_hash("target1234"),),
-        )
-        db.execute(
-            "UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='evaluator'",
-            (generate_password_hash("leader1234"),),
-        )
+        db.execute("UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='admin'", (generate_password_hash("admin1234"),))
+        db.execute("UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='target'", (generate_password_hash("target1234"),))
+        db.execute("UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='evaluator'", (generate_password_hash("leader1234"),))
     if scalar_count(db, "evaluation_cycles") == 0:
-        db.execute(
-            "INSERT INTO evaluation_cycles(name, start_date, end_date) VALUES (?, ?, ?)",
-            ("2026\ub144 1\ubd84\uae30 \uc218\uc2b5\ud3c9\uac00", "2026-01-01", "2026-03-31"),
-        )
+        db.execute("INSERT INTO evaluation_cycles(name, start_date, end_date) VALUES (?, ?, ?)", ("2026년 1분기 수습평가", "2026-01-01", "2026-03-31"))
     if scalar_count(db, "assessment_items") == 0:
         db.executemany(
             "INSERT INTO assessment_items(code,title,prompt,grade_s,grade_a,grade_b,grade_c) VALUES (?,?,?,?,?,?,?)",
             [
-                (
-                    "TEAM_CONTRIBUTION",
-                    "\ud300\ubaa9\ud45c \uae30\uc5ec\ub3c4",
-                    "\uc785\uc0ac \uc2dc \ud569\uc758\ub41c \uc6b0\ub9ac \ud300\uc758 \ub2f9\uba74 \uacfc\uc81c \ud574\uacb0\uc5d0 \ubcf8\uc778\uc758 \uc5c5\ubb34\uac00 \uc2e4\uc81c\ub85c \uae30\uc5ec\ud588\uc2b5\ub2c8\uae4c?",
-                    "\ud575\uc2ec\ubb38\uc81c \ud574\uacb0 \ub610\ub294 \uc5ed\ud560 \ubc94\uc704\ub97c \ub118\uc5b4 \ud300 \ubaa9\ud45c \ub2ec\uc131\uc5d0 \uacb0\uc815\uc801 \uae30\uc5ec",
-                    "\ud569\uc758\ub41c \uc5ed\ud560 \ub0b4 \uc784\ubb34\ub97c \ucda9\uc2e4\ud788 \uc218\ud589\ud574 \ud300 \uacfc\uc81c \ud574\uacb0\uc5d0 \uae30\uc5ec",
-                    "\uc5c5\ubb34 \uc218\ud589\uc740 \ud588\uc73c\ub098 \uc8fc\ub3c4\uc131\uc774 \ubd80\uc871\ud574 \uc9c0\uc18d \uac00\uc774\ub4dc \ud544\uc694",
-                    "\ud300 \uacfc\uc81c\uc640 \ubb34\uad00\ud55c \uc5c5\ubb34 \ub610\ub294 \uacb0\uacfc\ubb3c \ud488\uc9c8 \ubbf8\ub2ec\ub85c \ud300\uc5d0 \ubd80\ub2f4",
-                ),
-                (
-                    "TASK_ACHIEVEMENT",
-                    "\ud575\uc2ec\uacfc\uc81c \ub2ec\uc131\ub3c4",
-                    "\ud569\uc758\uc11c\uc5d0 \uba85\uc2dc\ub41c 3\uac1c\uc6d4 \ub0b4 \uae30\ub300\uc131\uacfc\ub97c \uc815\uc131/\uc815\ub7c9\uc801\uc73c\ub85c \ub2ec\uc131\ud588\uc2b5\ub2c8\uae4c?",
-                    "\ubaa9\ud45c 120% \uc774\uc0c1 \ub610\ub294 \uae30\ub300 \uc218\uc900\uc744 \ud6e8\uc52c \uc0c1\ud68c",
-                    "\ubaa9\ud45c 100% \ub2ec\uc131 \ubc0f \ud569\uc758\ub41c \ud488\uc9c8 \ucda9\uc871",
-                    "\ubaa9\ud45c \uc57d 80% \ub2ec\uc131 \ub610\ub294 \uc77c\uc815/\ud488\uc9c8 \ubcf4\uc644 \ud544\uc694",
-                    "\ub2ec\uc131\ub960 70% \ubbf8\ub9cc \ub610\ub294 \uc2e4\ubb34 \ud65c\uc6a9\uc774 \uc5b4\ub824\uc6b4 \ud488\uc9c8",
-                ),
-                (
-                    "BEHAVIOR_ALIGNMENT",
-                    "\uae30\ub300\ud589\ub3d9 \ubd80\ud569\ub3c4",
-                    "\ud569\uc758\uc11c\uc5d0 \uba85\uc2dc\ub41c \uae30\ub300\ud589\ub3d9\uc744 \uc900\uc218\ud558\uc600\uc2b5\ub2c8\uae4c?",
-                    "\uc644\ubcbd \uc900\uc218\ub97c \ub118\uc5b4 \ud0c0\uc778 \ubaa8\ubc94 \ub610\ub294 \ub354 \ub098\uc740 \ud589\ub3d9 \uc591\uc2dd \uc81c\uc548",
-                    "\ud569\uc758\ub41c \ud589\ub3d9\uac00\uc774\ub4dc\ub97c \uc608\uc678 \uc5c6\uc774 \uc900\uc218",
-                    "\ub300\uccb4\ub85c \uc900\uc218\ud588\uc73c\ub098 \ud2b9\uc815 \uc0c1\ud669\uc5d0\uc11c \ud589\ub3d9 \uad50\uc815 \ud544\uc694",
-                    "\ud589\ub3d9\uae30\uc900 \ubc18\ubcf5 \uc704\ubc18 \ubc0f \uac1c\uc120 \uc694\uccad\uc5d0\ub3c4 \ubcc0\ud654 \ubd80\uc871",
-                ),
+                ("TEAM_CONTRIBUTION", "팀목표 기여도", "입사 시 합의된 우리 팀의 당면 과제 해결에 본인의 업무가 실제로 기여했습니까?",
+                 "핵심문제 해결 또는 역할 범위를 넘어 팀 목표 달성에 결정적 기여",
+                 "합의된 역할 내 임무를 충실히 수행해 팀 과제 해결에 기여",
+                 "업무 수행은 했으나 주도성이 부족해 지속 가이드 필요",
+                 "팀 과제와 무관한 업무 또는 결과물 품질 미달로 팀에 부담"),
+                ("TASK_ACHIEVEMENT", "핵심과제 달성도", "합의서에 명시된 3개월 내 기대성과를 정성/정량적으로 달성했습니까?",
+                 "목표 120% 이상 또는 기대 수준을 훨씬 상회",
+                 "목표 100% 달성 및 합의된 품질 충족",
+                 "목표 약 80% 달성 또는 일정/품질 보완 필요",
+                 "달성율 70% 미만 또는 실무 활용이 어려운 품질"),
+                ("BEHAVIOR_ALIGNMENT", "기대행동 부합도", "합의서에 명시된 기대행동을 준수하였습니까?",
+                 "완벽 준수를 넘어 타인 모범 또는 더 나은 행동 양식 제안",
+                 "합의된 행동가이드를 예외 없이 준수",
+                 "대체로 준수했으나 특정 상황에서 행동 교정 필요",
+                 "행동기준 반복 위반 및 개선 요청에도 변화 부족"),
             ],
         )
-    db.execute(
-        """
-        INSERT INTO app_settings(key, value)
-        VALUES ('peer_visibility', 'evaluator_only')
-        ON CONFLICT(key) DO NOTHING
-        """
-    )
+    db.execute("INSERT INTO app_settings(key, value) VALUES ('peer_visibility', 'evaluator_only') ON CONFLICT(key) DO NOTHING")
     if scalar_count(db, "peer_reviewers") == 0:
-        db.executemany(
-            "INSERT INTO peer_reviewers(name) VALUES (?)",
-            [
-                ("\ub3d9\ub8cc\ud3c9\uac00\uc790 \uae40\ub3d9\ub8cc",),
-                ("\ub3d9\ub8cc\ud3c9\uac00\uc790 \uc774\ub3d9\ub8cc",),
-                ("\ub3d9\ub8cc\ud3c9\uac00\uc790 \ubc15\ub3d9\ub8cc",),
-            ],
-        )
+        db.executemany("INSERT INTO peer_reviewers(name) VALUES (?)", [("동료평가자 김동료",), ("동료평가자 이동료",), ("동료평가자 박동료",)])
     db.commit()
     db.close()
 
@@ -529,11 +439,30 @@ def ensure_db_initialized():
     _db_initialized = True
 
 
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+
 def current_user():
     user_id = session.get("user_id")
     if not user_id:
         return None
     return get_db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def is_within_access_period(user):
+    if not user:
+        return False
+    if user["role"] == "admin":
+        return True
+    t = today_str()
+    start = user.get("access_start") or user["access_start"] if "access_start" in (user.keys() if hasattr(user, "keys") else []) else None
+    end = user.get("access_end") or user["access_end"] if "access_end" in (user.keys() if hasattr(user, "keys") else []) else None
+    if start and t < start:
+        return False
+    if end and t > end:
+        return False
+    return True
 
 
 def require_role(role=None):
@@ -544,23 +473,30 @@ def require_role(role=None):
                 return redirect(url_for("login"))
             if role and user["role"] != role:
                 abort(403)
+            if not is_within_access_period(user):
+                return render_template_string(COMMON_STYLE + """
+                <div style="text-align:center;margin-top:80px;">
+                  <div style="font-size:48px;margin-bottom:16px;">🔒</div>
+                  <h2 style="border:none;">접근 기간이 아닙니다</h2>
+                  <p style="color:#666;">현재 계정의 접근 허용 기간이 아닙니다.<br/>관리자에게 문의해 주세요.</p>
+                  <a href="/logout" class="btn" style="display:inline-block;margin-top:20px;text-decoration:none;">로그아웃</a>
+                </div>""" + FOOTER)
             return fn(*args, **kwargs)
-
         wrapper.__name__ = fn.__name__
         return wrapper
-
     return deco
 
 
+# ---------------------------------------------------------------------------
+# Business logic helpers
+# ---------------------------------------------------------------------------
+
 def summarize_peer_comments(db, evaluatee_id):
-    rows = db.execute(
-        "SELECT peer_comment FROM peer_surveys WHERE evaluatee_id = ? ORDER BY id DESC",
-        (evaluatee_id,),
-    ).fetchall()
+    rows = db.execute("SELECT peer_comment FROM peer_surveys WHERE evaluatee_id = ? ORDER BY id DESC", (evaluatee_id,)).fetchall()
     if not rows:
-        return "\uc218\uc9d1\ub41c \ub3d9\ub8cc \uc758\uacac\uc774 \uc5c6\uc2b5\ub2c8\ub2e4."
+        return "수집된 동료 의견이 없습니다."
     comments = [r["peer_comment"] for r in rows]
-    return "\ucd1d {}\uac74 \uc218\uc9d1. \uc8fc\uc694 \uc758\uacac: {}".format(len(comments), "; ".join(comments[:3]))
+    return "총 {}건 수집. 주요 의견: {}".format(len(comments), "; ".join(comments[:3]))
 
 
 def get_peer_visibility(db):
@@ -568,16 +504,11 @@ def get_peer_visibility(db):
     if not row:
         return "evaluator_only"
     value = row["value"]
-    if value not in PEER_VISIBILITY_OPTIONS:
-        return "evaluator_only"
-    return value
+    return value if value in PEER_VISIBILITY_OPTIONS else "evaluator_only"
 
 
 def get_item_grades_for_evaluatee(db, evaluatee_id):
-    rows = db.execute(
-        "SELECT item_id, grade FROM leader_assessments WHERE evaluatee_id = ?",
-        (evaluatee_id,),
-    ).fetchall()
+    rows = db.execute("SELECT item_id, grade FROM leader_assessments WHERE evaluatee_id = ?", (evaluatee_id,)).fetchall()
     grouped = {}
     for row in rows:
         grouped.setdefault(row["item_id"], []).append(row["grade"])
@@ -595,8 +526,8 @@ def decide_result(item_grades):
         return "IN_PROGRESS"
     s_count = grades.count("S")
     a_count = grades.count("A")
-    b_count = grades.count("B")
     c_count = grades.count("C")
+    b_count = grades.count("B")
     if c_count >= 1:
         return "FAIL"
     if (a_count + s_count) == len(grades) and s_count >= 2:
@@ -611,93 +542,185 @@ def decide_result(item_grades):
 def build_ai_questions(note):
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return (
-            "1. \uc774\ubc88 \ubc1c\ud45c\uc758 \ud575\uc2ec \uc131\uacfc\ub97c \uc218\uce58 \uc911\uc2ec\uc73c\ub85c \ub2e4\uc2dc \uc124\uba85\ud574 \uc8fc\uc138\uc694.\n"
-            "2. \uac00\uc7a5 \uc5b4\ub824\uc6e0\ub358 \uc758\uc0ac\uacb0\uc815 \uc21c\uac04\uacfc \ud310\ub2e8 \uae30\uc900\uc740 \ubb34\uc5c7\uc774\uc5c8\ub098\uc694?\n"
-            "3. \ud611\uc5c5 \uacfc\uc815\uc758 \ubcd1\ubaa9\uc744 \uc5b4\ub5bb\uac8c \ud574\uacb0\ud588\ub098\uc694?\n"
-            "4. \uac19\uc740 \uacfc\uc81c\ub97c \ub2e4\uc2dc \uc218\ud589\ud55c\ub2e4\uba74 \uc5b4\ub5a4 \uc810\uc744 \ubc14\uafb8\uaca0\ub098\uc694?\n"
-            "5. \ub2e4\uc74c 90\uc77c \ub3d9\uc548\uc758 \ucd5c\uc6b0\uc120 \uac1c\uc120 \ud56d\ubaa9 1\uac00\uc9c0\ub294 \ubb34\uc5c7\uc778\uac00\uc694?"
-        )
-    prompt = (
-        "Generate 5 probation-review questions in Korean from this note. "
-        "Focus on concrete behavior, evidence, and improvement actions.\n\n"
-        f"Note:\n{note}"
-    )
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-        f"?key={api_key}"
-    )
+        return ("1. 이번 발표의 핵심 성과를 수치 중심으로 다시 설명해 주세요.\n"
+                "2. 가장 어려웠던 의사결정 순간과 판단 기준은 무엇이었나요?\n"
+                "3. 협업 과정의 병목을 어떻게 해결했나요?\n"
+                "4. 같은 과제를 다시 수행한다면 어떤 점을 바꾸겠나요?\n"
+                "5. 다음 90일 동안의 최우선 개선 항목 1가지는 무엇인가요?")
+    prompt = ("Generate 5 probation-review questions in Korean from this note. "
+              "Focus on concrete behavior, evidence, and improvement actions.\n\nNote:\n" + note)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
     payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    response = requests.post(url, json=payload, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    try:
+        response = requests.post(url, json=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        return "AI 질문 생성에 실패했습니다. 잠시 후 다시 시도해주세요."
 
 
-DECISION_LABELS = {
-    "SUPER_PASS": "\ud569\uaca9 (\ud575\uc2ec\uc778\uc7ac)",
-    "PASS": "\ud569\uaca9 (\uc6b0\uc218\uc778\uc7ac)",
-    "EXTENSION": "\uc218\uc2b5 \uc5f0\uc7a5",
-    "FAIL": "\ubd88\ud569\uaca9",
-    "IN_PROGRESS": "\uc9c4\ud589 \uc911",
-}
+def polish_feedback_with_ai(feedbacks_text, target_name):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return feedbacks_text
+    prompt = (
+        f"다음은 수습 평가 대상자 '{target_name}'에 대한 여러 평가자의 피드백입니다.\n"
+        "이 피드백들을 하나의 종합 피드백으로 정리해주세요.\n"
+        "요구사항:\n"
+        "1. 맞춤법과 문법을 교정해주세요\n"
+        "2. 중복되는 내용을 통합하세요\n"
+        "3. 긍정적 피드백과 개선 필요 사항을 구분해서 정리하세요\n"
+        "4. 존댓말로 작성하세요\n"
+        "5. 구체적이고 건설적인 톤을 유지하세요\n\n"
+        f"평가자 피드백:\n{feedbacks_text}"
+    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    try:
+        response = requests.post(url, json=payload, timeout=20)
+        response.raise_for_status()
+        data = response.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        return feedbacks_text
 
-COMMON_STYLE = """
-<!DOCTYPE html>
+
+# ---------------------------------------------------------------------------
+# Design system
+# ---------------------------------------------------------------------------
+
+COMMON_STYLE = """<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>\uc218\uc2b5\ud3c9\uac00 \uc2dc\uc2a4\ud15c</title>
+<title>수습평가 시스템</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  body { font-family: 'Segoe UI', 'Malgun Gothic', sans-serif; max-width: 960px; margin: 0 auto; padding: 16px; color: #222; }
-  nav { background: #2c3e50; padding: 10px 16px; border-radius: 6px; margin-bottom: 20px; }
-  nav a { color: #ecf0f1; text-decoration: none; margin-right: 16px; font-size: 14px; }
-  nav a:hover { text-decoration: underline; }
-  nav .right { float: right; }
-  h2 { border-bottom: 2px solid #333; padding-bottom: 8px; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
-  th { background: #f5f5f5; }
-  button { padding: 8px 20px; cursor: pointer; background: #2c3e50; color: #fff; border: none; border-radius: 4px; }
-  button:hover { background: #1a252f; }
-  .card { border: 1px solid #ddd; padding: 14px; margin: 10px 0; border-radius: 6px; background: #fafafa; }
-  a { color: #1a73e8; }
-  textarea { width: 100%; box-sizing: border-box; }
-  fieldset { margin: 10px 0; padding: 12px; }
-  .grade-desc { font-size: 12px; color: #555; margin-left: 4px; }
-  select { padding: 4px 8px; }
-  input[type="file"] { margin: 4px 0; }
+  :root {
+    --primary: #4F46E5; --primary-dark: #3730A3; --primary-light: #EEF2FF;
+    --success: #059669; --success-bg: #ECFDF5;
+    --warning: #D97706; --warning-bg: #FFFBEB;
+    --danger: #DC2626; --danger-bg: #FEF2F2;
+    --gray-50: #F9FAFB; --gray-100: #F3F4F6; --gray-200: #E5E7EB;
+    --gray-300: #D1D5DB; --gray-400: #9CA3AF; --gray-500: #6B7280;
+    --gray-600: #4B5563; --gray-700: #374151; --gray-800: #1F2937;
+    --gray-900: #111827;
+    --radius: 10px; --shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
+    --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', 'Malgun Gothic', -apple-system, sans-serif; background: var(--gray-50); color: var(--gray-800); line-height: 1.6; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  nav { background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%); padding: 14px 24px; margin-bottom: 28px; border-radius: var(--radius); display: flex; align-items: center; justify-content: space-between; box-shadow: var(--shadow-md); }
+  nav .nav-links a { color: rgba(255,255,255,0.85); text-decoration: none; margin-right: 20px; font-size: 14px; font-weight: 500; transition: color 0.2s; }
+  nav .nav-links a:hover { color: #fff; }
+  nav .nav-right a { color: rgba(255,255,255,0.7); text-decoration: none; font-size: 13px; }
+  nav .nav-right a:hover { color: #fff; }
+  h1 { font-size: 28px; font-weight: 700; color: var(--gray-900); margin-bottom: 8px; }
+  h2 { font-size: 22px; font-weight: 700; color: var(--gray-900); margin-bottom: 6px; border: none; padding: 0; }
+  h3 { font-size: 17px; font-weight: 600; color: var(--gray-700); margin: 24px 0 12px; }
+  .subtitle { color: var(--gray-500); font-size: 14px; margin-bottom: 24px; }
+  .section { background: #fff; border-radius: var(--radius); padding: 24px; margin-bottom: 20px; box-shadow: var(--shadow); border: 1px solid var(--gray-200); }
+  .card { background: #fff; border: 1px solid var(--gray-200); padding: 18px; margin: 12px 0; border-radius: var(--radius); transition: box-shadow 0.2s; }
+  .card:hover { box-shadow: var(--shadow-md); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--gray-200); }
+  th { background: var(--gray-50); color: var(--gray-600); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.03em; }
+  tr:hover { background: var(--gray-50); }
+  .btn { display: inline-block; padding: 10px 22px; font-size: 14px; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; transition: all 0.2s; text-decoration: none; }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:hover { background: var(--primary-dark); transform: translateY(-1px); box-shadow: var(--shadow-md); }
+  .btn-success { background: var(--success); color: #fff; }
+  .btn-success:hover { background: #047857; }
+  .btn-danger { background: var(--danger); color: #fff; font-size: 12px; padding: 6px 14px; }
+  .btn-danger:hover { background: #B91C1C; }
+  .btn-sm { padding: 6px 14px; font-size: 12px; }
+  .btn-outline { background: transparent; border: 1px solid var(--gray-300); color: var(--gray-600); }
+  .btn-outline:hover { border-color: var(--primary); color: var(--primary); }
+  input[type="text"], input[type="email"], input[type="password"], input[type="date"], select, textarea {
+    width: 100%; padding: 10px 14px; border: 1px solid var(--gray-300); border-radius: 8px; font-size: 14px;
+    font-family: inherit; transition: border-color 0.2s, box-shadow 0.2s; background: #fff;
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(79,70,229,0.1); }
+  label { display: block; font-size: 13px; font-weight: 600; color: var(--gray-700); margin-bottom: 6px; }
+  .form-group { margin-bottom: 16px; }
+  .form-row { display: flex; gap: 16px; flex-wrap: wrap; }
+  .form-row > .form-group { flex: 1; min-width: 200px; }
+  fieldset { border: 1px solid var(--gray-200); border-radius: var(--radius); padding: 16px; margin: 12px 0; }
+  legend { font-weight: 600; font-size: 14px; color: var(--gray-700); padding: 0 8px; }
+  .badge { display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; }
+  .badge-success { background: var(--success-bg); color: var(--success); }
+  .badge-warning { background: var(--warning-bg); color: var(--warning); }
+  .badge-danger { background: var(--danger-bg); color: var(--danger); }
+  .badge-info { background: var(--primary-light); color: var(--primary); }
+  .badge-gray { background: var(--gray-100); color: var(--gray-500); }
+  .grade-selector { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  .grade-option { position: relative; }
+  .grade-option input { position: absolute; opacity: 0; }
+  .grade-option label { display: block; padding: 8px 16px; border: 2px solid var(--gray-200); border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 14px; text-align: center; transition: all 0.2s; min-width: 60px; }
+  .grade-option input:checked + label { border-color: var(--primary); background: var(--primary-light); color: var(--primary); }
+  .grade-option label:hover { border-color: var(--gray-400); }
+  .grade-desc { font-size: 11px; color: var(--gray-500); display: block; margin-top: 2px; font-weight: 400; }
+  .alert { padding: 14px 18px; border-radius: var(--radius); margin-bottom: 16px; font-size: 14px; }
+  .alert-success { background: var(--success-bg); color: var(--success); border: 1px solid #A7F3D0; }
+  .alert-warning { background: var(--warning-bg); color: var(--warning); border: 1px solid #FDE68A; }
+  .alert-danger { background: var(--danger-bg); color: var(--danger); border: 1px solid #FECACA; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .stat-card { background: #fff; border: 1px solid var(--gray-200); border-radius: var(--radius); padding: 20px; text-align: center; }
+  .stat-card .stat-value { font-size: 32px; font-weight: 700; color: var(--primary); }
+  .stat-card .stat-label { font-size: 13px; color: var(--gray-500); margin-top: 4px; }
+  a { color: var(--primary); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  input[type="file"] { padding: 8px; }
+  .link-copy { font-size: 12px; word-break: break-all; color: var(--gray-500); }
+  @media print {
+    nav, .btn, .no-print, form { display: none !important; }
+    body { background: #fff; }
+    .section { box-shadow: none; border: 1px solid #ddd; page-break-inside: avoid; }
+    .container { max-width: 100%; padding: 0; }
+  }
+  @media (max-width: 768px) {
+    .container { padding: 12px; }
+    .form-row { flex-direction: column; }
+    .stat-grid { grid-template-columns: 1fr 1fr; }
+    table { font-size: 12px; }
+    th, td { padding: 8px 6px; }
+  }
 </style>
 </head>
 <body>
+<div class="container">
 """
 
+FOOTER = "\n</div></body></html>"
 
-FOOTER = "\n</body></html>"
+NAV_ADMIN = """<nav>
+<div class="nav-links">
+  <a href="/admin">대시보드</a>
+  <a href="/admin/users">사용자</a>
+  <a href="/admin/cycles">사이클</a>
+  <a href="/admin/peers">동료평가자</a>
+</div>
+<div class="nav-right"><a href="/logout">로그아웃</a></div>
+</nav>"""
 
-NAV_ADMIN = (
-    '<nav>'
-    '<a href="/admin">\ub300\uc2dc\ubcf4\ub4dc</a>'
-    '<a href="/admin/users">\uc0ac\uc6a9\uc790 \uad00\ub9ac</a>'
-    '<a href="/admin/cycles">\uc0ac\uc774\ud074 \uad00\ub9ac</a>'
-    '<a href="/admin/peers">\ub3d9\ub8cc\ud3c9\uac00\uc790 \uad00\ub9ac</a>'
-    '<a class="right" href="/logout">\ub85c\uadf8\uc544\uc6c3</a>'
-    '</nav>'
-)
-NAV_TARGET = (
-    '<nav>'
-    '<a href="/target">\ub300\uc2dc\ubcf4\ub4dc</a>'
-    '<a class="right" href="/logout">\ub85c\uadf8\uc544\uc6c3</a>'
-    '</nav>'
-)
-NAV_EVALUATOR = (
-    '<nav>'
-    '<a href="/evaluator">\ub300\uc2dc\ubcf4\ub4dc</a>'
-    '<a class="right" href="/logout">\ub85c\uadf8\uc544\uc6c3</a>'
-    '</nav>'
-)
+NAV_TARGET = """<nav>
+<div class="nav-links"><a href="/target">대시보드</a></div>
+<div class="nav-right"><a href="/logout">로그아웃</a></div>
+</nav>"""
 
+NAV_EVALUATOR = """<nav>
+<div class="nav-links"><a href="/evaluator">대시보드</a></div>
+<div class="nav-right"><a href="/logout">로그아웃</a></div>
+</nav>"""
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.route("/")
 def index():
@@ -720,22 +743,26 @@ def login():
         if user and user["password_hash"] and check_password_hash(user["password_hash"], password):
             session["user_id"] = int(user["id"])
             return redirect(url_for("dashboard"))
-        error = "\ub85c\uadf8\uc778 \uc815\ubcf4\uac00 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4."
-    return render_template_string(
-        COMMON_STYLE + """
-        <h2>\uc218\uc2b5\ud3c9\uac00 \uc2dc\uc2a4\ud15c \ub85c\uadf8\uc778</h2>
-        <p style="color:#666;">\uae30\ubcf8 \uacc4\uc815: admin@company.local / admin1234</p>
-        {% if error %}<p style="color:#c0392b;">{{error}}</p>{% endif %}
-        <form method="post">
-          <label>Email</label><br/>
-          <input type="email" name="email" required/><br/><br/>
-          <label>\ube44\ubc00\ubc88\ud638</label><br/>
-          <input type="password" name="password" required/><br/><br/>
-          <button type="submit">\ub85c\uadf8\uc778</button>
+        error = "이메일 또는 비밀번호가 올바르지 않습니다."
+    return render_template_string(COMMON_STYLE + """
+    <div style="max-width:420px;margin:60px auto;">
+      <div class="section" style="text-align:center;">
+        <h1 style="margin-bottom:4px;">수습평가 시스템</h1>
+        <p class="subtitle">Probation Evaluation System</p>
+        {% if error %}<div class="alert alert-danger">{{error}}</div>{% endif %}
+        <form method="post" style="text-align:left;">
+          <div class="form-group">
+            <label>이메일</label>
+            <input type="email" name="email" placeholder="example@company.local" required/>
+          </div>
+          <div class="form-group">
+            <label>비밀번호</label>
+            <input type="password" name="password" required/>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%;margin-top:8px;">로그인</button>
         </form>
-        """ + FOOTER,
-        error=error,
-    )
+      </div>
+    </div>""" + FOOTER, error=error)
 
 
 @app.route("/logout")
@@ -756,39 +783,35 @@ def dashboard():
     return redirect(url_for("evaluator_dashboard"))
 
 
+# ---------------------------------------------------------------------------
+# Admin
+# ---------------------------------------------------------------------------
+
 @app.route("/admin", methods=["GET", "POST"])
 @require_role("admin")
 def admin_dashboard():
     db = get_db()
     if request.method == "POST":
         if request.form.get("form_type") == "policy":
-            peer_visibility = request.form.get("peer_visibility", "evaluator_only")
-            if peer_visibility not in PEER_VISIBILITY_OPTIONS:
-                peer_visibility = "evaluator_only"
-            db.execute(
-                """
-                INSERT INTO app_settings(key, value) VALUES ('peer_visibility', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (peer_visibility,),
-            )
+            pv = request.form.get("peer_visibility", "evaluator_only")
+            if pv not in PEER_VISIBILITY_OPTIONS:
+                pv = "evaluator_only"
+            db.execute("INSERT INTO app_settings(key, value) VALUES ('peer_visibility', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (pv,))
             db.commit()
             return redirect(url_for("admin_dashboard"))
 
         target_user_id = request.form.get("target_user_id")
         cycle_id = request.form.get("cycle_id")
         evaluator_ids = request.form.getlist("evaluator_ids")[:3]
-        cursor = db.execute(
-            "INSERT INTO evaluatees(user_id,cycle_id,peer_survey_token,created_at) VALUES (?,?,?,?) RETURNING id",
-            (target_user_id, cycle_id, secrets.token_hex(8), now()),
-        )
+        relationships = request.form.getlist("relationships")
+        cursor = db.execute("INSERT INTO evaluatees(user_id,cycle_id,peer_survey_token,created_at) VALUES (?,?,?,?) RETURNING id",
+                            (target_user_id, cycle_id, secrets.token_hex(8), now()))
         inserted = cursor.fetchone()
         evaluatee_id = inserted["id"] if hasattr(inserted, "keys") else inserted[0]
-        for evaluator_id in evaluator_ids:
-            db.execute(
-                "INSERT INTO evaluator_assignments(evaluatee_id,evaluator_user_id) VALUES (?,?) ON CONFLICT(evaluatee_id,evaluator_user_id) DO NOTHING",
-                (evaluatee_id, evaluator_id),
-            )
+        for i, evaluator_id in enumerate(evaluator_ids):
+            rel = relationships[i] if i < len(relationships) else "direct_leader"
+            db.execute("INSERT INTO evaluator_assignments(evaluatee_id,evaluator_user_id,relationship) VALUES (?,?,?) ON CONFLICT(evaluatee_id,evaluator_user_id) DO UPDATE SET relationship=excluded.relationship",
+                       (evaluatee_id, evaluator_id, rel))
         db.commit()
         return redirect(url_for("admin_dashboard"))
 
@@ -796,64 +819,110 @@ def admin_dashboard():
     evaluators = db.execute("SELECT * FROM users WHERE role='evaluator' ORDER BY id").fetchall()
     cycles = db.execute("SELECT * FROM evaluation_cycles ORDER BY id DESC").fetchall()
     peer_visibility = get_peer_visibility(db)
-    evaluatees = db.execute(
-        """
-        SELECT e.id, u.name AS target_name, c.name AS cycle_name, e.peer_survey_token, e.presentation_filename, ar.decision
-        FROM evaluatees e
-        JOIN users u ON u.id = e.user_id
+    evaluatees = db.execute("""
+        SELECT e.id, u.name AS target_name, u.team AS target_team, c.name AS cycle_name,
+               e.peer_survey_token, e.presentation_filename, ar.decision, e.self_submitted_at
+        FROM evaluatees e JOIN users u ON u.id = e.user_id
         JOIN evaluation_cycles c ON c.id = e.cycle_id
         LEFT JOIN aggregated_results ar ON ar.evaluatee_id = e.id
         ORDER BY e.id DESC
-        """
-    ).fetchall()
-    return render_template_string(
-        COMMON_STYLE + NAV_ADMIN + """
-        <h2>\uad00\ub9ac\uc790 \ub300\uc2dc\ubcf4\ub4dc</h2>
-        <h3>\ub3d9\ub8cc\ud3c9\uac00 \uacf5\uac1c \uc815\ucc45</h3>
-        <form method="post">
-          <input type="hidden" name="form_type" value="policy"/>
+    """).fetchall()
+
+    total = len(evaluatees)
+    submitted = sum(1 for e in evaluatees if e["self_submitted_at"])
+    decided = sum(1 for e in evaluatees if e["decision"] and e["decision"] != "IN_PROGRESS")
+
+    return render_template_string(COMMON_STYLE + NAV_ADMIN + """
+    <h1>관리자 대시보드</h1>
+    <p class="subtitle">수습평가 현황을 한눈에 확인하고 관리합니다</p>
+
+    <div class="stat-grid">
+      <div class="stat-card"><div class="stat-value">{{total}}</div><div class="stat-label">전체 대상자</div></div>
+      <div class="stat-card"><div class="stat-value">{{submitted}}</div><div class="stat-label">자가평가 완료</div></div>
+      <div class="stat-card"><div class="stat-value">{{decided}}</div><div class="stat-label">판정 완료</div></div>
+      <div class="stat-card"><div class="stat-value">{{total - decided}}</div><div class="stat-label">진행 중</div></div>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">동료평가 공개 정책</h3>
+      <form method="post" class="form-row" style="align-items:end;">
+        <input type="hidden" name="form_type" value="policy"/>
+        <div class="form-group" style="flex:2;">
           <select name="peer_visibility">
-            {% for key, label in peer_visibility_options.items() %}
-              <option value="{{key}}" {% if key == peer_visibility %}selected{% endif %}>{{label}}</option>
+            {% for key, label in pv_options.items() %}
+            <option value="{{key}}" {% if key == peer_visibility %}selected{% endif %}>{{label}}</option>
             {% endfor %}
           </select>
-          <button type="submit">\uc815\ucc45 \uc800\uc7a5</button>
-        </form>
-        <h3>\ud3c9\uac00 \ub300\uc0c1\uc790 \uc0dd\uc131</h3>
-        <form method="post">
-          <label>\ub300\uc0c1\uc790</label>
-          <select name="target_user_id">{% for t in targets %}<option value="{{t.id}}">{{t.name}}</option>{% endfor %}</select>
-          <label>\ud3c9\uac00 \uc0ac\uc774\ud074</label>
-          <select name="cycle_id">{% for c in cycles %}<option value="{{c.id}}">{{c.name}}</option>{% endfor %}</select>
-          <fieldset>
-            <legend>\ud3c9\uac00\uc790 (\ucd5c\ub300 3\uba85)</legend>
-            {% for e in evaluators %}
-              <label><input type="checkbox" name="evaluator_ids" value="{{e.id}}"> {{e.name}}</label><br/>
-            {% endfor %}
-          </fieldset>
-          <button type="submit">\uc0dd\uc131</button>
-        </form>
-        <h3>\ub300\uc0c1\uc790 \ubaa9\ub85d</h3>
-        <table>
-          <tr><th>ID</th><th>\ub300\uc0c1\uc790</th><th>\uc0ac\uc774\ud074</th><th>\ub3d9\ub8cc \uc124\ubb38 \ub9c1\ud06c</th><th>PT \ud30c\uc77c</th><th>\ud310\uc815</th><th>\uc561\uc158</th></tr>
-          {% for e in evaluatees %}
-          <tr>
-            <td>{{e.id}}</td><td>{{e.target_name}}</td><td>{{e.cycle_name}}</td><td>/peer-survey/{{e.peer_survey_token}}</td>
-            <td>{{e.presentation_filename or '-'}}</td><td>{{decision_labels.get(e.decision or 'IN_PROGRESS', e.decision or '\uc9c4\ud589 \uc911')}}</td>
-            <td><a href="{{url_for('aggregate_result', evaluatee_id=e.id)}}">\ucde8\ud569</a> | <a href="{{url_for('deliver_feedback', evaluatee_id=e.id)}}">\uc804\ub2ec</a></td>
-          </tr>
-          {% endfor %}
-        </table>
-        """ + FOOTER,
-        targets=targets,
-        evaluators=evaluators,
-        cycles=cycles,
-        evaluatees=evaluatees,
-        peer_visibility=peer_visibility,
-        peer_visibility_options=PEER_VISIBILITY_OPTIONS,
-        decision_labels=DECISION_LABELS,
-    )
+        </div>
+        <div class="form-group" style="flex:0;"><button type="submit" class="btn btn-primary btn-sm">저장</button></div>
+      </form>
+    </div>
 
+    <div class="section">
+      <h3 style="margin-top:0;">평가 대상자 생성</h3>
+      <form method="post">
+        <div class="form-row">
+          <div class="form-group">
+            <label>대상자</label>
+            <select name="target_user_id">{% for t in targets %}<option value="{{t.id}}">{{t.name}} ({{t.team or '-'}})</option>{% endfor %}</select>
+          </div>
+          <div class="form-group">
+            <label>평가 사이클</label>
+            <select name="cycle_id">{% for c in cycles %}<option value="{{c.id}}">{{c.name}}</option>{% endfor %}</select>
+          </div>
+        </div>
+        <fieldset>
+          <legend>평가자 배정 (최대 3명)</legend>
+          {% for e in evaluators %}
+          <div style="display:flex;align-items:center;gap:12px;margin:8px 0;">
+            <label style="margin:0;display:flex;align-items:center;gap:6px;min-width:180px;">
+              <input type="checkbox" name="evaluator_ids" value="{{e.id}}"> {{e.name}} <span style="color:var(--gray-400);font-weight:400;">({{e.team or '-'}})</span>
+            </label>
+            <select name="relationships" style="width:auto;padding:6px 10px;">
+              {% for rk, rl in rel_options.items() %}<option value="{{rk}}">{{rl}}</option>{% endfor %}
+            </select>
+          </div>
+          {% endfor %}
+        </fieldset>
+        <button type="submit" class="btn btn-primary">생성</button>
+      </form>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">대상자 목록</h3>
+      <table>
+        <tr><th>대상자</th><th>팀</th><th>사이클</th><th>자가평가</th><th>판정</th><th>동료설문</th><th>액션</th></tr>
+        {% for e in evaluatees %}
+        <tr>
+          <td><b>{{e.target_name}}</b></td>
+          <td>{{e.target_team or '-'}}</td>
+          <td>{{e.cycle_name}}</td>
+          <td>{% if e.self_submitted_at %}<span class="badge badge-success">완료</span>{% else %}<span class="badge badge-gray">미제출</span>{% endif %}</td>
+          <td>{% set d = e.decision or 'IN_PROGRESS' %}
+              {% if d == 'SUPER_PASS' %}<span class="badge badge-success">{{dl[d]}}</span>
+              {% elif d == 'PASS' %}<span class="badge badge-success">{{dl[d]}}</span>
+              {% elif d == 'EXTENSION' %}<span class="badge badge-warning">{{dl[d]}}</span>
+              {% elif d == 'FAIL' %}<span class="badge badge-danger">{{dl[d]}}</span>
+              {% else %}<span class="badge badge-gray">{{dl[d]}}</span>{% endif %}</td>
+          <td><a href="{{url_for('peer_survey', token=e.peer_survey_token, _external=True)}}" target="_blank" class="link-copy">링크 열기</a></td>
+          <td>
+            <a href="{{url_for('aggregate_result', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">취합</a>
+            <a href="{{url_for('deliver_feedback', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">전달</a>
+            <a href="{{url_for('admin_report', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">리포트</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """ + FOOTER, targets=targets, evaluators=evaluators, cycles=cycles,
+        evaluatees=evaluatees, peer_visibility=peer_visibility,
+        pv_options=PEER_VISIBILITY_OPTIONS, dl=DECISION_LABELS,
+        rel_options=RELATIONSHIP_OPTIONS, total=total, submitted=submitted, decided=decided)
+
+
+# ---------------------------------------------------------------------------
+# Target
+# ---------------------------------------------------------------------------
 
 @app.route("/target", methods=["GET", "POST"])
 @require_role("target")
@@ -863,7 +932,11 @@ def target_dashboard():
     notice = request.args.get("notice", "")
     evaluatee = db.execute("SELECT * FROM evaluatees WHERE user_id=? ORDER BY id DESC LIMIT 1", (user["id"],)).fetchone()
     if not evaluatee:
-        return "\ubc30\uc815\ub41c \ud3c9\uac00\uac00 \uc5c6\uc2b5\ub2c8\ub2e4."
+        return render_template_string(COMMON_STYLE + NAV_TARGET + """
+        <div class="section" style="text-align:center;padding:60px;">
+          <h2>배정된 평가가 없습니다</h2>
+          <p class="subtitle">관리자에게 문의해주세요.</p>
+        </div>""" + FOOTER)
     items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
     existing = db.execute("SELECT * FROM self_assessments WHERE evaluatee_id=?", (evaluatee["id"],)).fetchall()
     existing_by_item = {row["item_id"]: row for row in existing}
@@ -871,104 +944,302 @@ def target_dashboard():
         file = request.files.get("presentation")
         if file and file.filename:
             UPLOAD_DIR.mkdir(exist_ok=True)
-            safe_name = secure_filename(file.filename)
-            if not safe_name:
-                safe_name = "presentation.pdf"
+            safe_name = secure_filename(file.filename) or "presentation.pdf"
             filename = f"{evaluatee['id']}_{int(datetime.now().timestamp())}_{safe_name}"
             try:
                 content = file.read()
                 if OBJECT_STORAGE_ENABLED:
                     object_key = f"presentations/{filename}"
-                    uploaded = upload_to_object_storage(object_key, content, file.mimetype)
-                    if uploaded:
-                        db.execute(
-                            "UPDATE evaluatees SET presentation_filename=?, presentation_file_id=?, presentation_storage='s3' WHERE id=?",
-                            (filename, object_key, evaluatee["id"]),
-                        )
-                        notice = "PT \ud30c\uc77c\uc774 \ud074\ub77c\uc6b0\ub4dc \uc800\uc7a5\uc18c\uc5d0 \uc800\uc7a5\ub418\uc5c8\uc2b5\ub2c8\ub2e4."
+                    if upload_to_object_storage(object_key, content, file.mimetype):
+                        db.execute("UPDATE evaluatees SET presentation_filename=?, presentation_file_id=?, presentation_storage='s3' WHERE id=?", (filename, object_key, evaluatee["id"]))
+                        notice = "PT 파일이 클라우드에 저장되었습니다."
                     else:
                         with open(UPLOAD_DIR / filename, "wb") as fp:
                             fp.write(content)
-                        db.execute(
-                            "UPDATE evaluatees SET presentation_filename=?, presentation_file_id=NULL, presentation_storage='local' WHERE id=?",
-                            (filename, evaluatee["id"]),
-                        )
-                        notice = "\ud074\ub77c\uc6b0\ub4dc \uc5f0\ub3d9 \uc2e4\ud328\ub85c \ub85c\uceec\uc5d0 \uc800\uc7a5\ub418\uc5c8\uc2b5\ub2c8\ub2e4."
+                        db.execute("UPDATE evaluatees SET presentation_filename=?, presentation_file_id=NULL, presentation_storage='local' WHERE id=?", (filename, evaluatee["id"]))
+                        notice = "클라우드 연동 실패로 로컬에 저장되었습니다."
                 else:
                     with open(UPLOAD_DIR / filename, "wb") as fp:
                         fp.write(content)
-                    db.execute(
-                        "UPDATE evaluatees SET presentation_filename=?, presentation_file_id=NULL, presentation_storage='local' WHERE id=?",
-                        (filename, evaluatee["id"]),
-                    )
-                    notice = "PT \ud30c\uc77c\uc774 \uc815\uc0c1 \uc800\uc7a5\ub418\uc5c8\uc2b5\ub2c8\ub2e4."
-            except OSError:
-                notice = "PT \ud30c\uc77c \uc800\uc7a5\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4. \ud30c\uc77c\uba85/\uc6a9\ub7c9\uc744 \ud655\uc778\ud574 \uc8fc\uc138\uc694."
+                    db.execute("UPDATE evaluatees SET presentation_filename=?, presentation_file_id=NULL, presentation_storage='local' WHERE id=?", (filename, evaluatee["id"]))
+                    notice = "PT 파일이 저장되었습니다."
+            except Exception:
+                notice = "PT 파일 저장에 실패했습니다."
         keep_text = request.form.get("keep_text", "")
         problem_text = request.form.get("problem_text", "")
         try_text = request.form.get("try_text", "")
         for item in items:
             grade = request.form.get(f"grade_{item['id']}", "B")
-            db.execute(
-                """
-                INSERT INTO self_assessments(evaluatee_id,item_id,grade,keep_text,problem_text,try_text,updated_at)
-                VALUES (?,?,?,?,?,?,?)
-                ON CONFLICT(evaluatee_id,item_id) DO UPDATE SET
-                    grade=excluded.grade,
-                    keep_text=excluded.keep_text,
-                    problem_text=excluded.problem_text,
-                    try_text=excluded.try_text,
-                    updated_at=excluded.updated_at
-                """,
-                (evaluatee["id"], item["id"], grade, keep_text, problem_text, try_text, now()),
-            )
+            db.execute("""INSERT INTO self_assessments(evaluatee_id,item_id,grade,keep_text,problem_text,try_text,updated_at)
+                VALUES (?,?,?,?,?,?,?) ON CONFLICT(evaluatee_id,item_id) DO UPDATE SET
+                grade=excluded.grade, keep_text=excluded.keep_text, problem_text=excluded.problem_text,
+                try_text=excluded.try_text, updated_at=excluded.updated_at""",
+                       (evaluatee["id"], item["id"], grade, keep_text, problem_text, try_text, now()))
         db.execute("UPDATE evaluatees SET self_submitted_at=? WHERE id=?", (now(), evaluatee["id"]))
         db.commit()
         return redirect(url_for("target_dashboard", notice=notice))
     result = db.execute("SELECT * FROM aggregated_results WHERE evaluatee_id=?", (evaluatee["id"],)).fetchone()
-    return render_template_string(
-        COMMON_STYLE + NAV_TARGET + """
-        <h2>\ud3c9\uac00 \ub300\uc0c1\uc790 \ud654\uba74</h2>
-        {% if notice %}<p style="color:#1e8449;"><b>{{notice}}</b></p>{% endif %}
-        <h3>PT \uc5c5\ub85c\ub4dc + \uc790\uac00\ud3c9\uac00</h3>
-        <form method="post" enctype="multipart/form-data">
-          <label><b>PT \ubc1c\ud45c \uc790\ub8cc</b></label><br/>
-          <input type="file" name="presentation"/><br/><br/>
-          <p>\ud604\uc7ac \uc800\uc7a5 \ud30c\uc77c: {% if evaluatee.presentation_filename %}<a href="{{url_for('presentation_file', evaluatee_id=evaluatee.id)}}">{{evaluatee.presentation_filename}}</a>{% else %}-{% endif %}</p>
-          {% for item in items %}
-            <div class="card">
-              <b>{{item.title}}</b><br/><small>{{item.prompt}}</small><br/>
-              {% set current = existing_by_item[item.id].grade if item.id in existing_by_item else 'B' %}
-              {% for g in ['S','A','B','C'] %}
-                <label><input type="radio" name="grade_{{item.id}}" value="{{g}}" {% if current==g %}checked{% endif %}>{{g}}
-                  <span class="grade-desc">({% if g=='S' %}{{item.grade_s}}{% elif g=='A' %}{{item.grade_a}}{% elif g=='B' %}{{item.grade_b}}{% else %}{{item.grade_c}}{% endif %})</span>
-                </label><br/>
-              {% endfor %}
-            </div>
-          {% endfor %}
-          <label>Keep(\uc798\ud55c \uc810)</label><br/><textarea name="keep_text" rows="3">{{existing[0].keep_text if existing else ''}}</textarea><br/>
-          <label>Problem(\uc544\uc26c\uc6b4 \uc810)</label><br/><textarea name="problem_text" rows="3">{{existing[0].problem_text if existing else ''}}</textarea><br/>
-          <label>Try(\uac1c\uc120 \uc2dc\ub3c4)</label><br/><textarea name="try_text" rows="3">{{existing[0].try_text if existing else ''}}</textarea><br/>
-          <button type="submit">\uc800\uc7a5</button>
-        </form>
-        <h3>\uacb0\uacfc</h3>
-        {% if result %}
-          <p><b>\ud310\uc815:</b> {{decision_labels.get(result.decision, result.decision)}}</p>
-          <p><b>\uc694\uc57d:</b> {{result.summary}}</p>
-          <p><b>\ud53c\ub4dc\ubc31:</b> {{result.admin_feedback or '-'}}</p>
-        {% else %}
-          <p>\uc544\uc9c1 \uacb0\uacfc\uac00 \uc804\ub2ec\ub418\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4.</p>
-        {% endif %}
-        """ + FOOTER,
-        items=items,
-        existing=existing,
-        existing_by_item=existing_by_item,
-        result=result,
-        evaluatee=evaluatee,
-        notice=notice,
-        decision_labels=DECISION_LABELS,
-    )
+    return render_template_string(COMMON_STYLE + NAV_TARGET + """
+    <h1>평가 대상자 화면</h1>
+    <p class="subtitle">{{user.name}} · {{user.team or ''}} · {{user.email}}</p>
+    {% if notice %}<div class="alert alert-success">{{notice}}</div>{% endif %}
 
+    <div class="section">
+      <h3 style="margin-top:0;">PT 업로드 + 자가평가</h3>
+      <form method="post" enctype="multipart/form-data">
+        <div class="form-group">
+          <label>PT 발표 자료</label>
+          <input type="file" name="presentation"/>
+          <p style="font-size:12px;color:var(--gray-500);margin-top:4px;">현재 파일: {% if evaluatee.presentation_filename %}<a href="{{url_for('presentation_file', evaluatee_id=evaluatee.id)}}">{{evaluatee.presentation_filename}}</a>{% else %}없음{% endif %}</p>
+        </div>
+        {% for item in items %}
+        <div class="card">
+          <b>{{item.title}}</b>
+          <p style="font-size:13px;color:var(--gray-500);margin:4px 0 10px;">{{item.prompt}}</p>
+          {% set current = existing_by_item[item.id].grade if item.id in existing_by_item else 'B' %}
+          <div class="grade-selector">
+            {% for g in ['S','A','B','C'] %}
+            <div class="grade-option">
+              <input type="radio" name="grade_{{item.id}}" value="{{g}}" id="g_{{item.id}}_{{g}}" {% if current==g %}checked{% endif %}>
+              <label for="g_{{item.id}}_{{g}}">{{g}}
+                <span class="grade-desc">{% if g=='S' %}{{item.grade_s}}{% elif g=='A' %}{{item.grade_a}}{% elif g=='B' %}{{item.grade_b}}{% else %}{{item.grade_c}}{% endif %}</span>
+              </label>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+        <div class="form-group"><label>Keep (잘한 점)</label><textarea name="keep_text" rows="3">{{existing[0].keep_text if existing else ''}}</textarea></div>
+        <div class="form-group"><label>Problem (아쉬운 점)</label><textarea name="problem_text" rows="3">{{existing[0].problem_text if existing else ''}}</textarea></div>
+        <div class="form-group"><label>Try (개선 시도)</label><textarea name="try_text" rows="3">{{existing[0].try_text if existing else ''}}</textarea></div>
+        <button type="submit" class="btn btn-primary">저장</button>
+      </form>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">평가 결과</h3>
+      {% if result and result.delivered_at %}
+        <div class="card">
+          <p><b>판정:</b> {{dl.get(result.decision, result.decision)}}</p>
+          <p style="margin-top:8px;"><b>피드백:</b></p>
+          <div style="white-space:pre-wrap;background:var(--gray-50);padding:14px;border-radius:8px;margin-top:6px;">{{result.ai_polished_feedback or result.admin_feedback or '-'}}</div>
+        </div>
+      {% else %}
+        <p style="color:var(--gray-500);">아직 결과가 전달되지 않았습니다.</p>
+      {% endif %}
+    </div>
+    """ + FOOTER, items=items, existing=existing, existing_by_item=existing_by_item,
+        result=result, evaluatee=evaluatee, user=user, dl=DECISION_LABELS, notice=notice)
+
+
+# ---------------------------------------------------------------------------
+# Evaluator
+# ---------------------------------------------------------------------------
+
+@app.route("/evaluator", methods=["GET", "POST"])
+@require_role("evaluator")
+def evaluator_dashboard():
+    db = get_db()
+    user = current_user()
+    assignments = db.execute("""
+        SELECT e.id AS evaluatee_id, u.name AS target_name, u.team AS target_team,
+               e.presentation_filename, ea.relationship
+        FROM evaluator_assignments ea
+        JOIN evaluatees e ON e.id = ea.evaluatee_id
+        JOIN users u ON u.id = e.user_id
+        WHERE ea.evaluator_user_id = ? ORDER BY e.id DESC
+    """, (user["id"],)).fetchall()
+    selected = request.args.get("evaluatee_id")
+    if request.method == "POST":
+        evaluatee_id = request.form.get("evaluatee_id")
+        items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
+        for item in items:
+            db.execute("""INSERT INTO leader_assessments(evaluatee_id,evaluator_user_id,item_id,grade,feedback_text,presentation_note,qa_note,updated_at)
+                VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(evaluatee_id,evaluator_user_id,item_id) DO UPDATE SET
+                grade=excluded.grade, feedback_text=excluded.feedback_text,
+                presentation_note=excluded.presentation_note, qa_note=excluded.qa_note, updated_at=excluded.updated_at""",
+                       (evaluatee_id, user["id"], item["id"],
+                        request.form.get(f"grade_{item['id']}", "B"),
+                        request.form.get("feedback_text", ""),
+                        request.form.get("presentation_note", ""),
+                        request.form.get("qa_note", ""), now()))
+        db.commit()
+        return redirect(url_for("evaluator_dashboard", evaluatee_id=evaluatee_id))
+    detail = None; self_data = []; items = []; leader_data = {}; peer_summary = ""; ai_questions = ""
+    if selected:
+        assigned = db.execute("SELECT * FROM evaluator_assignments WHERE evaluatee_id=? AND evaluator_user_id=?", (selected, user["id"])).fetchone()
+        if not assigned:
+            abort(403)
+        detail = db.execute("SELECT e.id, e.presentation_filename, u.name AS target_name, u.team AS target_team FROM evaluatees e JOIN users u ON u.id = e.user_id WHERE e.id = ?", (selected,)).fetchone()
+        if not detail:
+            abort(404)
+        self_data = db.execute("""SELECT ai.title, sa.grade, sa.keep_text, sa.problem_text, sa.try_text
+            FROM self_assessments sa JOIN assessment_items ai ON ai.id = sa.item_id
+            WHERE sa.evaluatee_id = ? ORDER BY ai.id""", (selected,)).fetchall()
+        items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
+        existing = db.execute("SELECT * FROM leader_assessments WHERE evaluatee_id=? AND evaluator_user_id=?", (selected, user["id"])).fetchall()
+        leader_data = {row["item_id"]: row for row in existing}
+        pv = get_peer_visibility(db)
+        if pv in ("evaluator_only", "admin_and_evaluator"):
+            peer_summary = summarize_peer_comments(db, selected)
+        else:
+            peer_summary = "관리자 전용 정책으로 비공개입니다."
+        ai_row = db.execute("SELECT suggested_questions FROM ai_question_logs WHERE evaluatee_id=? AND evaluator_user_id=? ORDER BY id DESC LIMIT 1", (selected, user["id"])).fetchone()
+        if ai_row:
+            ai_questions = ai_row["suggested_questions"]
+    return render_template_string(COMMON_STYLE + NAV_EVALUATOR + """
+    <h1>평가자 화면</h1>
+    <p class="subtitle">{{user.name}} · {{user.team or ''}} · {{user.email}}</p>
+
+    <div class="section">
+      <h3 style="margin-top:0;">배정 대상자</h3>
+      <table>
+        <tr><th>대상자</th><th>팀</th><th>관계</th><th>PT</th><th>액션</th></tr>
+        {% for a in assignments %}
+        <tr {% if selected == a.evaluatee_id|string %}style="background:var(--primary-light);"{% endif %}>
+          <td><b>{{a.target_name}}</b></td>
+          <td>{{a.target_team or '-'}}</td>
+          <td><span class="badge badge-info">{{rel_labels.get(a.relationship, a.relationship)}}</span></td>
+          <td>{% if a.presentation_filename %}업로드됨{% else %}-{% endif %}</td>
+          <td><a href="{{url_for('evaluator_dashboard', evaluatee_id=a.evaluatee_id)}}" class="btn btn-outline btn-sm">평가하기</a></td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+
+    {% if detail %}
+    <div class="section">
+      <h3 style="margin-top:0;">{{detail.target_name}} <span style="font-weight:400;color:var(--gray-400);">{{detail.target_team or ''}}</span></h3>
+      <p style="margin-bottom:12px;">PT 파일: {% if detail.presentation_filename %}<a href="{{url_for('presentation_file', evaluatee_id=detail.id)}}">{{detail.presentation_filename}}</a>{% else %}미업로드{% endif %}</p>
+      <p style="margin-bottom:16px;font-size:13px;color:var(--gray-500);">동료평가 요약: {{peer_summary}}</p>
+
+      {% if self_data %}
+      <h3>자가평가 조회</h3>
+      {% for s in self_data %}
+      <div class="card">
+        <b>{{s.title}}</b> — <span class="badge badge-info">{{s.grade}}</span>
+        <div style="font-size:13px;color:var(--gray-600);margin-top:8px;">
+          <b>Keep:</b> {{s.keep_text or '-'}}<br/><b>Problem:</b> {{s.problem_text or '-'}}<br/><b>Try:</b> {{s.try_text or '-'}}
+        </div>
+      </div>
+      {% endfor %}
+      {% endif %}
+
+      <h3>리더 평가</h3>
+      <form method="post">
+        <input type="hidden" name="evaluatee_id" value="{{detail.id}}"/>
+        {% for item in items %}
+        {% set current = leader_data[item.id].grade if item.id in leader_data else 'B' %}
+        <div class="card">
+          <b>{{item.title}}</b>
+          <p style="font-size:13px;color:var(--gray-500);margin:4px 0 10px;">{{item.prompt}}</p>
+          <div class="grade-selector">
+            {% for g in ['S','A','B','C'] %}
+            <div class="grade-option">
+              <input type="radio" name="grade_{{item.id}}" value="{{g}}" id="lg_{{item.id}}_{{g}}" {% if g==current %}checked{% endif %}>
+              <label for="lg_{{item.id}}_{{g}}">{{g}}
+                <span class="grade-desc">{% if g=='S' %}{{item.grade_s}}{% elif g=='A' %}{{item.grade_a}}{% elif g=='B' %}{{item.grade_b}}{% else %}{{item.grade_c}}{% endif %}</span>
+              </label>
+            </div>
+            {% endfor %}
+          </div>
+        </div>
+        {% endfor %}
+        <div class="form-group"><label>PT 메모</label><textarea name="presentation_note" rows="3">{{ leader_data.values()|list|first.presentation_note if leader_data else '' }}</textarea></div>
+        <div class="form-group"><label>Q&A 메모</label><textarea name="qa_note" rows="3">{{ leader_data.values()|list|first.qa_note if leader_data else '' }}</textarea></div>
+        <div class="form-group"><label>대상자 전달 피드백</label><textarea name="feedback_text" rows="4">{{ leader_data.values()|list|first.feedback_text if leader_data else '' }}</textarea></div>
+        <button type="submit" class="btn btn-primary">저장</button>
+      </form>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">AI 질문 생성</h3>
+      <form method="post" action="{{url_for('ai_questions', evaluatee_id=detail.id)}}">
+        <div class="form-group"><textarea name="source_note" rows="4" placeholder="발표/질의응답 메모를 입력하면 질문안을 생성합니다."></textarea></div>
+        <button type="submit" class="btn btn-outline">질문 생성</button>
+      </form>
+      {% if ai_questions %}<pre style="white-space:pre-wrap;background:var(--gray-50);padding:14px;border-radius:8px;margin-top:12px;font-size:13px;">{{ai_questions}}</pre>{% endif %}
+    </div>
+    {% endif %}
+    """ + FOOTER, assignments=assignments, detail=detail, self_data=self_data,
+        items=items, leader_data=leader_data, peer_summary=peer_summary,
+        ai_questions=ai_questions, user=user, selected=selected,
+        rel_labels=RELATIONSHIP_OPTIONS)
+
+
+@app.route("/evaluator/<int:evaluatee_id>/ai-questions", methods=["POST"])
+@require_role("evaluator")
+def ai_questions(evaluatee_id):
+    db = get_db()
+    user = current_user()
+    source_note = request.form.get("source_note", "").strip()
+    if not source_note:
+        return redirect(url_for("evaluator_dashboard", evaluatee_id=evaluatee_id))
+    suggested = build_ai_questions(source_note)
+    db.execute("INSERT INTO ai_question_logs(evaluatee_id,evaluator_user_id,source_note,suggested_questions,created_at) VALUES (?,?,?,?,?)",
+               (evaluatee_id, user["id"], source_note, suggested, now()))
+    db.commit()
+    return redirect(url_for("evaluator_dashboard", evaluatee_id=evaluatee_id))
+
+
+# ---------------------------------------------------------------------------
+# Peer survey
+# ---------------------------------------------------------------------------
+
+@app.route("/peer-survey/<token>", methods=["GET", "POST"])
+def peer_survey(token):
+    db = get_db()
+    evaluatee = db.execute("SELECT e.id, u.name AS target_name FROM evaluatees e JOIN users u ON u.id=e.user_id WHERE e.peer_survey_token=?", (token,)).fetchone()
+    peers = db.execute("SELECT id, name FROM peer_reviewers ORDER BY id").fetchall()
+    if not evaluatee:
+        abort(404)
+    if request.method == "POST":
+        comment = request.form.get("peer_comment", "").strip()
+        peer_id = request.form.get("peer_id", "").strip()
+        peer_name = request.form.get("peer_name", "").strip()
+        if peer_id:
+            peer_row = db.execute("SELECT name FROM peer_reviewers WHERE id=?", (peer_id,)).fetchone()
+            if peer_row:
+                peer_name = peer_row["name"]
+        if comment:
+            db.execute("INSERT INTO peer_surveys(evaluatee_id,peer_name,peer_comment,created_at) VALUES (?,?,?,?)", (evaluatee["id"], peer_name, comment, now()))
+            db.commit()
+            return render_template_string(COMMON_STYLE + """
+            <div style="text-align:center;margin-top:80px;">
+              <div style="font-size:48px;margin-bottom:16px;">✅</div>
+              <h2 style="border:none;">제출 완료</h2>
+              <p class="subtitle">동료 평가 의견이 성공적으로 제출되었습니다.</p>
+            </div>""" + FOOTER)
+    return render_template_string(COMMON_STYLE + """
+    <div style="max-width:600px;margin:40px auto;">
+      <div class="section">
+        <h2 style="margin-bottom:4px;">동료 평가 설문</h2>
+        <p class="subtitle">대상자: <b>{{evaluatee.target_name}}</b></p>
+        <form method="post">
+          <div class="form-group">
+            <label>동료평가자 선택</label>
+            <select name="peer_id">
+              <option value="">-- 선택 --</option>
+              {% for p in peers %}<option value="{{p.id}}">{{p.name}}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="form-group">
+            <label>직접 입력 (선택)</label>
+            <input type="text" name="peer_name" placeholder="이름"/>
+          </div>
+          <div class="form-group">
+            <label>의견</label>
+            <textarea name="peer_comment" rows="6" required placeholder="대상자에 대한 의견을 자유롭게 작성해주세요."></textarea>
+          </div>
+          <button type="submit" class="btn btn-primary" style="width:100%;">제출</button>
+        </form>
+      </div>
+    </div>""" + FOOTER, evaluatee=evaluatee, peers=peers)
+
+
+# ---------------------------------------------------------------------------
+# File access
+# ---------------------------------------------------------------------------
 
 @app.route("/uploads/<path:filename>")
 def download_upload(filename):
@@ -985,10 +1256,7 @@ def can_access_evaluatee_file(user, evaluatee):
     if user["role"] == "target":
         return evaluatee["user_id"] == user["id"]
     if user["role"] == "evaluator":
-        row = get_db().execute(
-            "SELECT 1 FROM evaluator_assignments WHERE evaluatee_id=? AND evaluator_user_id=?",
-            (evaluatee["id"], user["id"]),
-        ).fetchone()
+        row = get_db().execute("SELECT 1 FROM evaluator_assignments WHERE evaluatee_id=? AND evaluator_user_id=?", (evaluatee["id"], user["id"])).fetchone()
         return bool(row)
     return False
 
@@ -1009,229 +1277,18 @@ def presentation_file(evaluatee_id):
         mime, content = download_from_object_storage(evaluatee["presentation_file_id"])
         if content is None:
             abort(404)
-        return Response(
-            content,
-            mimetype=mime,
-            headers={"Content-Disposition": f'inline; filename="{evaluatee["presentation_filename"]}"'},
-        )
+        return Response(content, mimetype=mime, headers={"Content-Disposition": f'inline; filename="{evaluatee["presentation_filename"]}"'})
     if storage == "gdrive" and evaluatee["presentation_file_id"]:
         name, mime, content = download_from_google_drive(evaluatee["presentation_file_id"])
         if content is None:
             abort(404)
-        return Response(
-            content,
-            mimetype=mime,
-            headers={"Content-Disposition": f'inline; filename="{name or evaluatee["presentation_filename"]}"'},
-        )
+        return Response(content, mimetype=mime, headers={"Content-Disposition": f'inline; filename="{name or evaluatee["presentation_filename"]}"'})
     return send_from_directory(UPLOAD_DIR, evaluatee["presentation_filename"], as_attachment=False)
 
 
-@app.route("/evaluator", methods=["GET", "POST"])
-@require_role("evaluator")
-def evaluator_dashboard():
-    db = get_db()
-    user = current_user()
-    assignments = db.execute(
-        """
-        SELECT e.id AS evaluatee_id, u.name AS target_name, e.presentation_filename
-        FROM evaluator_assignments ea
-        JOIN evaluatees e ON e.id = ea.evaluatee_id
-        JOIN users u ON u.id = e.user_id
-        WHERE ea.evaluator_user_id = ?
-        ORDER BY e.id DESC
-        """,
-        (user["id"],),
-    ).fetchall()
-    selected = request.args.get("evaluatee_id")
-    if request.method == "POST":
-        evaluatee_id = request.form.get("evaluatee_id")
-        items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
-        for item in items:
-            db.execute(
-                """
-                INSERT INTO leader_assessments(evaluatee_id,evaluator_user_id,item_id,grade,feedback_text,presentation_note,qa_note,updated_at)
-                VALUES (?,?,?,?,?,?,?,?)
-                ON CONFLICT(evaluatee_id,evaluator_user_id,item_id) DO UPDATE SET
-                    grade=excluded.grade,
-                    feedback_text=excluded.feedback_text,
-                    presentation_note=excluded.presentation_note,
-                    qa_note=excluded.qa_note,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    evaluatee_id,
-                    user["id"],
-                    item["id"],
-                    request.form.get(f"grade_{item['id']}", "B"),
-                    request.form.get("feedback_text", ""),
-                    request.form.get("presentation_note", ""),
-                    request.form.get("qa_note", ""),
-                    now(),
-                ),
-            )
-        db.commit()
-        return redirect(url_for("evaluator_dashboard", evaluatee_id=evaluatee_id))
-    detail = None
-    self_data = []
-    items = []
-    leader_data = {}
-    peer_summary = ""
-    ai_questions = ""
-    if selected:
-        assigned = db.execute(
-            "SELECT 1 FROM evaluator_assignments WHERE evaluatee_id=? AND evaluator_user_id=?",
-            (selected, user["id"]),
-        ).fetchone()
-        if not assigned:
-            abort(403)
-        detail = db.execute(
-            "SELECT e.id, e.presentation_filename, u.name AS target_name FROM evaluatees e JOIN users u ON u.id = e.user_id WHERE e.id = ?",
-            (selected,),
-        ).fetchone()
-        if not detail:
-            abort(404)
-        self_data = db.execute(
-            """
-            SELECT ai.title, sa.grade, sa.keep_text, sa.problem_text, sa.try_text
-            FROM self_assessments sa
-            JOIN assessment_items ai ON ai.id = sa.item_id
-            WHERE sa.evaluatee_id = ?
-            ORDER BY ai.id
-            """,
-            (selected,),
-        ).fetchall()
-        items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
-        existing = db.execute(
-            "SELECT * FROM leader_assessments WHERE evaluatee_id=? AND evaluator_user_id=?",
-            (selected, user["id"]),
-        ).fetchall()
-        leader_data = {row["item_id"]: row for row in existing}
-        peer_visibility = get_peer_visibility(db)
-        if peer_visibility in ("evaluator_only", "admin_and_evaluator"):
-            peer_summary = summarize_peer_comments(db, selected)
-        else:
-            peer_summary = "\uad00\ub9ac\uc790 \uc804\uc6a9 \uc815\ucc45\uc73c\ub85c \ud3c9\uac00\uc790\uc5d0\uac8c \ube44\uacf5\uac1c\uc785\ub2c8\ub2e4."
-        ai_row = db.execute(
-            "SELECT suggested_questions FROM ai_question_logs WHERE evaluatee_id=? AND evaluator_user_id=? ORDER BY id DESC LIMIT 1",
-            (selected, user["id"]),
-        ).fetchone()
-        if ai_row:
-            ai_questions = ai_row["suggested_questions"]
-    return render_template_string(
-        COMMON_STYLE + NAV_EVALUATOR + """
-        <h2>\ud3c9\uac00\uc790 \ud654\uba74</h2>
-        <h3>\ubc30\uc815 \ub300\uc0c1\uc790</h3>
-        <ul>{% for a in assignments %}<li><a href="{{url_for('evaluator_dashboard', evaluatee_id=a.evaluatee_id)}}">{{a.target_name}}</a></li>{% endfor %}</ul>
-        {% if detail %}
-          <h3>{{detail.target_name}}</h3>
-          <p>PT \ud30c\uc77c: {% if detail.presentation_filename %}<a href="{{url_for('presentation_file', evaluatee_id=detail.id)}}">{{detail.presentation_filename}}</a>{% else %}\ubbf8\uc5c5\ub85c\ub4dc{% endif %}</p>
-          <p>\ub3d9\ub8cc\ud3c9\uac00 \ucde8\ud569: {{peer_summary}}</p>
-          <h4>\uc790\uac00\ud3c9\uac00 \uc870\ud68c</h4>
-          {% for s in self_data %}
-            <div class="card">
-              <b>{{s.title}} - {{s.grade}}</b><br/>Keep: {{s.keep_text or '-'}}<br/>Problem: {{s.problem_text or '-'}}<br/>Try: {{s.try_text or '-'}}
-            </div>
-          {% endfor %}
-          <h4>\ub9ac\ub354 \ud3c9\uac00</h4>
-          <form method="post">
-            <input type="hidden" name="evaluatee_id" value="{{detail.id}}"/>
-            {% for item in items %}
-              {% set current = leader_data[item.id].grade if item.id in leader_data else 'B' %}
-              <div class="card">
-                <b>{{item.title}}</b><br/><small>{{item.prompt}}</small><br/>
-                {% for g in ['S','A','B','C'] %}
-                  <label><input type="radio" name="grade_{{item.id}}" value="{{g}}" {% if g==current %}checked{% endif %}>{{g}}
-                    <span class="grade-desc">({% if g=='S' %}{{item.grade_s}}{% elif g=='A' %}{{item.grade_a}}{% elif g=='B' %}{{item.grade_b}}{% else %}{{item.grade_c}}{% endif %})</span>
-                  </label><br/>
-                {% endfor %}
-              </div>
-            {% endfor %}
-            <label>PT \uba54\ubaa8</label><br/><textarea name="presentation_note" rows="3">{{ leader_data.values()|list|first.presentation_note if leader_data else '' }}</textarea><br/>
-            <label>Q&A \uba54\ubaa8</label><br/><textarea name="qa_note" rows="3">{{ leader_data.values()|list|first.qa_note if leader_data else '' }}</textarea><br/>
-            <label>\ub300\uc0c1\uc790 \uc804\ub2ec \ud53c\ub4dc\ubc31</label><br/><textarea name="feedback_text" rows="4">{{ leader_data.values()|list|first.feedback_text if leader_data else '' }}</textarea><br/>
-            <button type="submit">\uc800\uc7a5</button>
-          </form>
-          <h4>AI \uc9c8\ubb38 \uc810\uac80</h4>
-          <form method="post" action="{{url_for('ai_questions', evaluatee_id=detail.id)}}">
-            <textarea name="source_note" rows="4" placeholder="\ubc1c\ud45c/\uc9c8\uc758\uc751\ub2f5 \uba54\ubaa8\ub97c \uc785\ub825\ud558\uba74 \uc9c8\ubb38\uc548\uc744 \uc0dd\uc131\ud569\ub2c8\ub2e4."></textarea><br/>
-            <button type="submit">\uc9c8\ubb38 \uc0dd\uc131</button>
-          </form>
-          {% if ai_questions %}<pre>{{ai_questions}}</pre>{% endif %}
-        {% endif %}
-        """ + FOOTER,
-        assignments=assignments,
-        detail=detail,
-        self_data=self_data,
-        items=items,
-        leader_data=leader_data,
-        peer_summary=peer_summary,
-        ai_questions=ai_questions,
-    )
-
-
-@app.route("/evaluator/<int:evaluatee_id>/ai-questions", methods=["POST"])
-@require_role("evaluator")
-def ai_questions(evaluatee_id):
-    db = get_db()
-    user = current_user()
-    source_note = request.form.get("source_note", "").strip()
-    if not source_note:
-        return redirect(url_for("evaluator_dashboard", evaluatee_id=evaluatee_id))
-    suggested = build_ai_questions(source_note)
-    db.execute(
-        "INSERT INTO ai_question_logs(evaluatee_id,evaluator_user_id,source_note,suggested_questions,created_at) VALUES (?,?,?,?,?)",
-        (evaluatee_id, user["id"], source_note, suggested, now()),
-    )
-    db.commit()
-    return redirect(url_for("evaluator_dashboard", evaluatee_id=evaluatee_id))
-
-
-@app.route("/peer-survey/<token>", methods=["GET", "POST"])
-def peer_survey(token):
-    db = get_db()
-    evaluatee = db.execute(
-        "SELECT e.id, u.name AS target_name FROM evaluatees e JOIN users u ON u.id=e.user_id WHERE e.peer_survey_token=?",
-        (token,),
-    ).fetchone()
-    peers = db.execute("SELECT id, name FROM peer_reviewers ORDER BY id").fetchall()
-    if not evaluatee:
-        abort(404)
-    if request.method == "POST":
-        comment = request.form.get("peer_comment", "").strip()
-        peer_id = request.form.get("peer_id", "").strip()
-        peer_name = request.form.get("peer_name", "").strip()
-        if peer_id:
-            peer_row = db.execute("SELECT name FROM peer_reviewers WHERE id=?", (peer_id,)).fetchone()
-            if peer_row:
-                peer_name = peer_row["name"]
-        if comment:
-            db.execute(
-                "INSERT INTO peer_surveys(evaluatee_id,peer_name,peer_comment,created_at) VALUES (?,?,?,?)",
-                (evaluatee["id"], peer_name, comment, now()),
-            )
-            db.commit()
-            return "\uc81c\ucd9c\ub418\uc5c8\uc2b5\ub2c8\ub2e4."
-    return render_template_string(
-        COMMON_STYLE + """
-        <h2>\ub3d9\ub8cc \ud3c9\uac00 \uc124\ubb38</h2>
-        <p>\ub300\uc0c1\uc790: {{evaluatee.target_name}}</p>
-        <form method="post">
-          <label>\ub3d9\ub8cc\ud3c9\uac00\uc790 \uc120\ud0dd</label><br/>
-          <select name="peer_id">
-            <option value="">-- \uc120\ud0dd --</option>
-            {% for p in peers %}
-              <option value="{{p.id}}">{{p.name}}</option>
-            {% endfor %}
-          </select><br/><br/>
-          <label>\uc9c1\uc811 \uc785\ub825(\uc120\ud0dd)</label><br/><input type="text" name="peer_name"/><br/>
-          <label>\uc758\uacac</label><br/><textarea name="peer_comment" rows="6" required></textarea><br/>
-          <button type="submit">\uc81c\ucd9c</button>
-        </form>
-        """ + FOOTER,
-        evaluatee=evaluatee,
-        peers=peers,
-    )
-
+# ---------------------------------------------------------------------------
+# Admin: aggregate & deliver
+# ---------------------------------------------------------------------------
 
 @app.route("/admin/aggregate/<int:evaluatee_id>")
 @require_role("admin")
@@ -1241,23 +1298,13 @@ def aggregate_result(evaluatee_id):
     item_grades = get_item_grades_for_evaluatee(db, evaluatee_id)
     decision = decide_result(item_grades)
     labels = [f"{item['title']}={item_grades.get(item['id'], 'N/A')}" for item in item_rows]
-    peer_visibility = get_peer_visibility(db)
-    if peer_visibility in ("admin_only", "admin_and_evaluator"):
-        peer_text = summarize_peer_comments(db, evaluatee_id)
-    else:
-        peer_text = "\ub3d9\ub8cc\ud3c9\uac00 \uc694\uc57d\uc740 \uad00\ub9ac\uc790 \ube44\uacf5\uac1c \uc815\ucc45\uc785\ub2c8\ub2e4."
+    pv = get_peer_visibility(db)
+    peer_text = summarize_peer_comments(db, evaluatee_id) if pv in ("admin_only", "admin_and_evaluator") else "비공개"
     summary = " / ".join(labels) + " / " + peer_text
-    db.execute(
-        """
-        INSERT INTO aggregated_results(evaluatee_id,decision,summary,updated_at)
-        VALUES (?,?,?,?)
-        ON CONFLICT(evaluatee_id) DO UPDATE SET
-            decision=excluded.decision,
-            summary=excluded.summary,
-            updated_at=excluded.updated_at
-        """,
-        (evaluatee_id, decision, summary, now()),
-    )
+    db.execute("""INSERT INTO aggregated_results(evaluatee_id,decision,summary,updated_at)
+        VALUES (?,?,?,?) ON CONFLICT(evaluatee_id) DO UPDATE SET
+        decision=excluded.decision, summary=excluded.summary, updated_at=excluded.updated_at""",
+               (evaluatee_id, decision, summary, now()))
     db.commit()
     return redirect(url_for("admin_dashboard"))
 
@@ -1268,30 +1315,208 @@ def deliver_feedback(evaluatee_id):
     db = get_db()
     result = db.execute("SELECT * FROM aggregated_results WHERE evaluatee_id=?", (evaluatee_id,)).fetchone()
     if not result:
-        return "\uba3c\uc800 \ucde8\ud569\uc744 \uc2e4\ud589\ud574 \uc8fc\uc138\uc694."
+        return redirect(url_for("aggregate_result", evaluatee_id=evaluatee_id))
+    target_info = db.execute("SELECT u.name FROM evaluatees e JOIN users u ON u.id=e.user_id WHERE e.id=?", (evaluatee_id,)).fetchone()
+    target_name = target_info["name"] if target_info else "대상자"
+
+    all_feedbacks = db.execute("""
+        SELECT DISTINCT la.feedback_text, u.name AS evaluator_name, ea.relationship
+        FROM leader_assessments la
+        JOIN users u ON u.id = la.evaluator_user_id
+        JOIN evaluator_assignments ea ON ea.evaluatee_id = la.evaluatee_id AND ea.evaluator_user_id = la.evaluator_user_id
+        WHERE la.evaluatee_id = ? AND la.feedback_text IS NOT NULL AND la.feedback_text != ''
+    """, (evaluatee_id,)).fetchall()
+    raw_feedbacks = "\n\n".join([f"[{RELATIONSHIP_OPTIONS.get(f['relationship'], f['relationship'])} - {f['evaluator_name']}]\n{f['feedback_text']}" for f in all_feedbacks])
+
     if request.method == "POST":
+        action = request.form.get("action", "deliver")
+        if action == "ai_polish":
+            polished = polish_feedback_with_ai(raw_feedbacks, target_name)
+            db.execute("UPDATE aggregated_results SET ai_polished_feedback=?, updated_at=? WHERE evaluatee_id=?", (polished, now(), evaluatee_id))
+            db.commit()
+            return redirect(url_for("deliver_feedback", evaluatee_id=evaluatee_id))
         admin_feedback = request.form.get("admin_feedback", "")
-        db.execute(
-            "UPDATE aggregated_results SET admin_feedback=?, delivered_at=?, updated_at=? WHERE evaluatee_id=?",
-            (admin_feedback, now(), now(), evaluatee_id),
-        )
+        db.execute("UPDATE aggregated_results SET admin_feedback=?, delivered_at=?, updated_at=? WHERE evaluatee_id=?",
+                   (admin_feedback, now(), now(), evaluatee_id))
         db.commit()
         return redirect(url_for("admin_dashboard"))
-    return render_template_string(
-        COMMON_STYLE + NAV_ADMIN + """
-        <h2>\uacb0\uacfc \uc804\ub2ec</h2>
-        <p>\ud310\uc815: {{decision_labels.get(result.decision, result.decision)}}</p>
-        <p>\uc694\uc57d: {{result.summary}}</p>
-        <form method="post">
-          <label>\uad00\ub9ac\uc790 \ud53c\ub4dc\ubc31</label><br/>
-          <textarea name="admin_feedback" rows="6">{{result.admin_feedback or ''}}</textarea><br/>
-          <button type="submit">\uc804\ub2ec</button>
-        </form>
-        """ + FOOTER,
-        result=result,
-        decision_labels=DECISION_LABELS,
-    )
 
+    return render_template_string(COMMON_STYLE + NAV_ADMIN + """
+    <h1>종합 피드백 전달</h1>
+    <p class="subtitle">{{target_name}}에게 전달할 피드백을 작성합니다</p>
+
+    <div class="section">
+      <h3 style="margin-top:0;">판정 결과</h3>
+      <p>{% set d = result.decision %}
+         {% if d == 'SUPER_PASS' %}<span class="badge badge-success">{{dl[d]}}</span>
+         {% elif d == 'PASS' %}<span class="badge badge-success">{{dl[d]}}</span>
+         {% elif d == 'EXTENSION' %}<span class="badge badge-warning">{{dl[d]}}</span>
+         {% elif d == 'FAIL' %}<span class="badge badge-danger">{{dl[d]}}</span>
+         {% else %}<span class="badge badge-gray">{{dl[d]}}</span>{% endif %}</p>
+      <p style="margin-top:8px;font-size:13px;color:var(--gray-500);">{{result.summary}}</p>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">전체 평가자 피드백 원문</h3>
+      {% for f in all_feedbacks %}
+      <div class="card">
+        <span class="badge badge-info">{{rel_labels.get(f.relationship, f.relationship)}}</span>
+        <b style="margin-left:8px;">{{f.evaluator_name}}</b>
+        <p style="margin-top:8px;white-space:pre-wrap;">{{f.feedback_text}}</p>
+      </div>
+      {% endfor %}
+      {% if not all_feedbacks %}<p style="color:var(--gray-400);">아직 제출된 피드백이 없습니다.</p>{% endif %}
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">AI 피드백 정리</h3>
+      <p style="font-size:13px;color:var(--gray-500);margin-bottom:12px;">전체 평가자의 피드백을 AI가 맞춤법 교정, 중복 통합, 구조화하여 정리합니다.</p>
+      <form method="post" style="margin-bottom:16px;">
+        <input type="hidden" name="action" value="ai_polish"/>
+        <button type="submit" class="btn btn-outline">AI로 피드백 정리하기</button>
+      </form>
+      {% if result.ai_polished_feedback %}
+      <div style="white-space:pre-wrap;background:var(--primary-light);padding:18px;border-radius:8px;font-size:14px;line-height:1.7;">{{result.ai_polished_feedback}}</div>
+      {% endif %}
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">최종 전달 피드백</h3>
+      <form method="post">
+        <input type="hidden" name="action" value="deliver"/>
+        <div class="form-group">
+          <label>관리자 피드백 (대상자에게 직접 전달됨)</label>
+          <textarea name="admin_feedback" rows="8">{{result.ai_polished_feedback or result.admin_feedback or ''}}</textarea>
+        </div>
+        <button type="submit" class="btn btn-success">대상자에게 전달</button>
+      </form>
+    </div>
+    """ + FOOTER, result=result, target_name=target_name, all_feedbacks=all_feedbacks,
+        dl=DECISION_LABELS, rel_labels=RELATIONSHIP_OPTIONS)
+
+
+# ---------------------------------------------------------------------------
+# Admin: Report
+# ---------------------------------------------------------------------------
+
+@app.route("/admin/report/<int:evaluatee_id>")
+@require_role("admin")
+def admin_report(evaluatee_id):
+    db = get_db()
+    evaluatee = db.execute("SELECT e.*, u.name AS target_name, u.team AS target_team, u.email AS target_email, c.name AS cycle_name FROM evaluatees e JOIN users u ON u.id=e.user_id JOIN evaluation_cycles c ON c.id=e.cycle_id WHERE e.id=?", (evaluatee_id,)).fetchone()
+    if not evaluatee:
+        abort(404)
+    items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
+    self_data = db.execute("SELECT sa.*, ai.title, ai.code FROM self_assessments sa JOIN assessment_items ai ON ai.id=sa.item_id WHERE sa.evaluatee_id=? ORDER BY ai.id", (evaluatee_id,)).fetchall()
+    leader_rows = db.execute("""SELECT la.*, u.name AS evaluator_name, ai.title AS item_title, ea.relationship
+        FROM leader_assessments la JOIN users u ON u.id=la.evaluator_user_id
+        JOIN assessment_items ai ON ai.id=la.item_id
+        JOIN evaluator_assignments ea ON ea.evaluatee_id=la.evaluatee_id AND ea.evaluator_user_id=la.evaluator_user_id
+        WHERE la.evaluatee_id=? ORDER BY la.evaluator_user_id, ai.id""", (evaluatee_id,)).fetchall()
+    peer_surveys = db.execute("SELECT * FROM peer_surveys WHERE evaluatee_id=? ORDER BY id", (evaluatee_id,)).fetchall()
+    result = db.execute("SELECT * FROM aggregated_results WHERE evaluatee_id=?", (evaluatee_id,)).fetchone()
+    item_grades = get_item_grades_for_evaluatee(db, evaluatee_id)
+    evaluators_info = db.execute("""SELECT u.name, u.team, ea.relationship FROM evaluator_assignments ea
+        JOIN users u ON u.id=ea.evaluator_user_id WHERE ea.evaluatee_id=?""", (evaluatee_id,)).fetchall()
+
+    return render_template_string(COMMON_STYLE + NAV_ADMIN + """
+    <div class="no-print" style="margin-bottom:16px;">
+      <button onclick="window.print()" class="btn btn-primary">리포트 인쇄 / PDF 저장</button>
+      <a href="{{url_for('admin_dashboard')}}" class="btn btn-outline" style="margin-left:8px;">돌아가기</a>
+    </div>
+
+    <div class="section">
+      <h1 style="text-align:center;margin-bottom:4px;">수습평가 최종 리포트</h1>
+      <p style="text-align:center;color:var(--gray-500);">{{evaluatee.cycle_name}}</p>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">대상자 정보</h3>
+      <table>
+        <tr><th style="width:140px;">이름</th><td>{{evaluatee.target_name}}</td><th style="width:140px;">팀</th><td>{{evaluatee.target_team or '-'}}</td></tr>
+        <tr><th>이메일</th><td>{{evaluatee.target_email}}</td><th>자가평가 제출</th><td>{{evaluatee.self_submitted_at or '미제출'}}</td></tr>
+      </table>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">평가자 정보</h3>
+      <table>
+        <tr><th>이름</th><th>팀</th><th>관계</th></tr>
+        {% for ev in evaluators_info %}
+        <tr><td>{{ev.name}}</td><td>{{ev.team or '-'}}</td><td>{{rel_labels.get(ev.relationship, ev.relationship)}}</td></tr>
+        {% endfor %}
+      </table>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">자가평가</h3>
+      {% for s in self_data %}
+      <div class="card">
+        <b>{{s.title}}</b> — <span class="badge badge-info">{{s.grade}}</span>
+        <div style="font-size:13px;margin-top:6px;"><b>Keep:</b> {{s.keep_text or '-'}}</div>
+        <div style="font-size:13px;"><b>Problem:</b> {{s.problem_text or '-'}}</div>
+        <div style="font-size:13px;"><b>Try:</b> {{s.try_text or '-'}}</div>
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">리더 평가 상세</h3>
+      {% for la in leader_rows %}
+      <div class="card">
+        <span class="badge badge-info">{{rel_labels.get(la.relationship, la.relationship)}}</span>
+        <b style="margin-left:8px;">{{la.evaluator_name}}</b> — <b>{{la.item_title}}</b>: <span class="badge badge-info">{{la.grade}}</span>
+        {% if la.feedback_text %}<p style="font-size:13px;margin-top:6px;">{{la.feedback_text}}</p>{% endif %}
+      </div>
+      {% endfor %}
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">종합 등급</h3>
+      <table>
+        <tr><th>평가항목</th><th>종합 등급</th></tr>
+        {% for item in items %}
+        <tr><td>{{item.title}}</td><td><span class="badge badge-info">{{item_grades.get(item.id, 'N/A')}}</span></td></tr>
+        {% endfor %}
+      </table>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">동료 평가</h3>
+      {% for ps in peer_surveys %}
+      <div class="card"><b>{{ps.peer_name or '익명'}}</b><p style="margin-top:4px;">{{ps.peer_comment}}</p></div>
+      {% endfor %}
+      {% if not peer_surveys %}<p style="color:var(--gray-400);">수집된 동료 의견이 없습니다.</p>{% endif %}
+    </div>
+
+    {% if result %}
+    <div class="section">
+      <h3 style="margin-top:0;">최종 판정</h3>
+      <p style="font-size:20px;font-weight:700;">
+        {% set d = result.decision %}
+        {% if d == 'SUPER_PASS' %}<span class="badge badge-success" style="font-size:16px;padding:8px 20px;">{{dl[d]}}</span>
+        {% elif d == 'PASS' %}<span class="badge badge-success" style="font-size:16px;padding:8px 20px;">{{dl[d]}}</span>
+        {% elif d == 'EXTENSION' %}<span class="badge badge-warning" style="font-size:16px;padding:8px 20px;">{{dl[d]}}</span>
+        {% elif d == 'FAIL' %}<span class="badge badge-danger" style="font-size:16px;padding:8px 20px;">{{dl[d]}}</span>
+        {% else %}<span class="badge badge-gray" style="font-size:16px;padding:8px 20px;">{{dl[d]}}</span>{% endif %}
+      </p>
+      {% if result.ai_polished_feedback or result.admin_feedback %}
+      <h3>전달 피드백</h3>
+      <div style="white-space:pre-wrap;background:var(--gray-50);padding:18px;border-radius:8px;line-height:1.7;">{{result.ai_polished_feedback or result.admin_feedback}}</div>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    <p style="text-align:center;color:var(--gray-400);font-size:12px;margin-top:32px;">생성일: {{now}} | 수습평가 시스템</p>
+    """ + FOOTER, evaluatee=evaluatee, items=items, self_data=self_data,
+        leader_rows=leader_rows, peer_surveys=peer_surveys, result=result,
+        item_grades=item_grades, evaluators_info=evaluators_info,
+        dl=DECISION_LABELS, rel_labels=RELATIONSHIP_OPTIONS, now=now())
+
+
+# ---------------------------------------------------------------------------
+# Admin: User / Cycle / Peer management
+# ---------------------------------------------------------------------------
 
 @app.route("/admin/users", methods=["GET", "POST"])
 @require_role("admin")
@@ -1304,22 +1529,28 @@ def manage_users():
             email = request.form.get("email", "").strip()
             role = request.form.get("role", "target")
             password = request.form.get("password", "").strip()
+            team = request.form.get("team", "").strip()
+            access_start = request.form.get("access_start", "").strip() or None
+            access_end = request.form.get("access_end", "").strip() or None
             if name and email and role in ("admin", "target", "evaluator"):
                 if not password:
-                    password = "target1234" if role == "target" else ("leader1234" if role == "evaluator" else "admin1234")
-                db.execute(
-                    "INSERT INTO users(name, email, role, password_hash) VALUES (?, ?, ?, ?)",
-                    (name, email, role, generate_password_hash(password)),
-                )
+                    password = {"target": "target1234", "evaluator": "leader1234", "admin": "admin1234"}.get(role, "pass1234")
+                db.execute("INSERT INTO users(name, email, role, password_hash, team, access_start, access_end) VALUES (?,?,?,?,?,?,?)",
+                           (name, email, role, generate_password_hash(password), team, access_start, access_end))
+                db.commit()
+        elif action == "update_access":
+            user_id = request.form.get("user_id")
+            access_start = request.form.get("access_start", "").strip() or None
+            access_end = request.form.get("access_end", "").strip() or None
+            team = request.form.get("team", "").strip()
+            if user_id:
+                db.execute("UPDATE users SET access_start=?, access_end=?, team=? WHERE id=?", (access_start, access_end, team, user_id))
                 db.commit()
         elif action == "reset_password":
             user_id = request.form.get("user_id")
             new_password = request.form.get("new_password", "").strip()
             if user_id and new_password:
-                db.execute(
-                    "UPDATE users SET password_hash=? WHERE id=?",
-                    (generate_password_hash(new_password), user_id),
-                )
+                db.execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(new_password), user_id))
                 db.commit()
         elif action == "delete":
             user_id = request.form.get("user_id")
@@ -1328,51 +1559,66 @@ def manage_users():
                 db.commit()
         return redirect(url_for("manage_users"))
     users = db.execute("SELECT * FROM users ORDER BY role, id").fetchall()
-    return render_template_string(
-        COMMON_STYLE + NAV_ADMIN + """
-        <h2>\uc0ac\uc6a9\uc790 \uad00\ub9ac</h2>
-        <h3>\uc0ac\uc6a9\uc790 \ucd94\uac00</h3>
-        <form method="post">
-          <input type="hidden" name="action" value="add"/>
-          <label>\uc774\ub984</label> <input type="text" name="name" required/>
-          <label>Email</label> <input type="email" name="email" required/>
-          <label>\uc5ed\ud560</label>
-          <select name="role">
-            <option value="target">\ud3c9\uac00\ub300\uc0c1\uc790</option>
-            <option value="evaluator">\ud3c9\uac00\uc790</option>
-            <option value="admin">\uad00\ub9ac\uc790</option>
-          </select>
-          <label>\ucd08\uae30 \ube44\ubc00\ubc88\ud638</label> <input type="text" name="password" placeholder="\ubbf8\uc785\ub825 \uc2dc \uc5ed\ud560\ubcc4 \uae30\ubcf8\uac12"/>
-          <button type="submit">\ucd94\uac00</button>
-        </form>
-        <h3>\uc0ac\uc6a9\uc790 \ubaa9\ub85d</h3>
-        <table>
-          <tr><th>ID</th><th>\uc774\ub984</th><th>Email</th><th>\uc5ed\ud560</th><th>\ube44\ubc00\ubc88\ud638 \uc7ac\uc124\uc815</th><th>\uc561\uc158</th></tr>
-          {% for u in users %}
-          <tr>
-            <td>{{u.id}}</td><td>{{u.name}}</td><td>{{u.email}}</td>
-            <td>{% if u.role=='admin' %}\uad00\ub9ac\uc790{% elif u.role=='target' %}\ud3c9\uac00\ub300\uc0c1\uc790{% else %}\ud3c9\uac00\uc790{% endif %}</td>
-            <td>
-              <form method="post" style="display:inline">
-                <input type="hidden" name="action" value="reset_password"/>
-                <input type="hidden" name="user_id" value="{{u.id}}"/>
-                <input type="text" name="new_password" placeholder="\uc0c8 \ube44\ubc00\ubc88\ud638" required/>
-                <button type="submit">\ubcc0\uacbd</button>
-              </form>
-            </td>
-            <td>
-              <form method="post" style="display:inline">
-                <input type="hidden" name="action" value="delete"/>
-                <input type="hidden" name="user_id" value="{{u.id}}"/>
-                <button type="submit" onclick="return confirm('\uc0ad\uc81c\ud558\uc2dc\uaca0\uc2b5\ub2c8\uae4c?')">\uc0ad\uc81c</button>
-              </form>
-            </td>
-          </tr>
-          {% endfor %}
-        </table>
-        """ + FOOTER,
-        users=users,
-    )
+    return render_template_string(COMMON_STYLE + NAV_ADMIN + """
+    <h1>사용자 관리</h1>
+    <p class="subtitle">사용자 추가, 접근기간 설정, 팀 배정을 관리합니다</p>
+
+    <div class="section">
+      <h3 style="margin-top:0;">사용자 추가</h3>
+      <form method="post">
+        <input type="hidden" name="action" value="add"/>
+        <div class="form-row">
+          <div class="form-group"><label>이름</label><input type="text" name="name" required/></div>
+          <div class="form-group"><label>이메일</label><input type="email" name="email" required/></div>
+          <div class="form-group"><label>역할</label>
+            <select name="role"><option value="target">평가대상자</option><option value="evaluator">평가자</option><option value="admin">관리자</option></select>
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group"><label>팀</label><input type="text" name="team" placeholder="예: 개발팀"/></div>
+          <div class="form-group"><label>초기 비밀번호</label><input type="text" name="password" placeholder="미입력 시 기본값"/></div>
+          <div class="form-group"><label>접근 시작일</label><input type="date" name="access_start"/></div>
+          <div class="form-group"><label>접근 종료일</label><input type="date" name="access_end"/></div>
+        </div>
+        <button type="submit" class="btn btn-primary">추가</button>
+      </form>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">사용자 목록</h3>
+      <table>
+        <tr><th>이름</th><th>이메일</th><th>역할</th><th>팀</th><th>접근기간</th><th>액션</th></tr>
+        {% for u in users %}
+        <tr>
+          <td><b>{{u.name}}</b></td>
+          <td style="font-size:13px;">{{u.email}}</td>
+          <td>{% if u.role=='admin' %}<span class="badge badge-danger">관리자</span>{% elif u.role=='target' %}<span class="badge badge-info">대상자</span>{% else %}<span class="badge badge-warning">평가자</span>{% endif %}</td>
+          <td>{{u.team or '-'}}</td>
+          <td style="font-size:12px;">{{u.access_start or '∞'}} ~ {{u.access_end or '∞'}}</td>
+          <td style="white-space:nowrap;">
+            <form method="post" style="display:inline;">
+              <input type="hidden" name="action" value="update_access"/>
+              <input type="hidden" name="user_id" value="{{u.id}}"/>
+              <input type="text" name="team" value="{{u.team or ''}}" placeholder="팀" style="width:70px;padding:4px 6px;font-size:12px;"/>
+              <input type="date" name="access_start" value="{{u.access_start or ''}}" style="width:120px;padding:4px 6px;font-size:12px;"/>
+              <input type="date" name="access_end" value="{{u.access_end or ''}}" style="width:120px;padding:4px 6px;font-size:12px;"/>
+              <button type="submit" class="btn btn-outline btn-sm">저장</button>
+            </form>
+            <form method="post" style="display:inline;margin-left:4px;">
+              <input type="hidden" name="action" value="reset_password"/><input type="hidden" name="user_id" value="{{u.id}}"/>
+              <input type="text" name="new_password" placeholder="새 비번" style="width:80px;padding:4px 6px;font-size:12px;" required/>
+              <button type="submit" class="btn btn-outline btn-sm">변경</button>
+            </form>
+            <form method="post" style="display:inline;margin-left:4px;">
+              <input type="hidden" name="action" value="delete"/><input type="hidden" name="user_id" value="{{u.id}}"/>
+              <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('삭제하시겠습니까?')">삭제</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """ + FOOTER, users=users)
 
 
 @app.route("/admin/cycles", methods=["GET", "POST"])
@@ -1386,10 +1632,7 @@ def manage_cycles():
             start_date = request.form.get("start_date", "")
             end_date = request.form.get("end_date", "")
             if name:
-                db.execute(
-                    "INSERT INTO evaluation_cycles(name, start_date, end_date) VALUES (?, ?, ?)",
-                    (name, start_date, end_date),
-                )
+                db.execute("INSERT INTO evaluation_cycles(name, start_date, end_date) VALUES (?,?,?)", (name, start_date, end_date))
                 db.commit()
         elif action == "delete":
             cycle_id = request.form.get("cycle_id")
@@ -1398,36 +1641,33 @@ def manage_cycles():
                 db.commit()
         return redirect(url_for("manage_cycles"))
     cycles = db.execute("SELECT * FROM evaluation_cycles ORDER BY id DESC").fetchall()
-    return render_template_string(
-        COMMON_STYLE + NAV_ADMIN + """
-        <h2>\ud3c9\uac00 \uc0ac\uc774\ud074 \uad00\ub9ac</h2>
-        <h3>\uc0ac\uc774\ud074 \ucd94\uac00</h3>
-        <form method="post">
-          <input type="hidden" name="action" value="add"/>
-          <label>\uc0ac\uc774\ud074\uba85</label> <input type="text" name="name" required/>
-          <label>\uc2dc\uc791\uc77c</label> <input type="date" name="start_date"/>
-          <label>\uc885\ub8cc\uc77c</label> <input type="date" name="end_date"/>
-          <button type="submit">\ucd94\uac00</button>
-        </form>
-        <h3>\uc0ac\uc774\ud074 \ubaa9\ub85d</h3>
-        <table>
-          <tr><th>ID</th><th>\uc0ac\uc774\ud074\uba85</th><th>\uc2dc\uc791\uc77c</th><th>\uc885\ub8cc\uc77c</th><th>\uc0c1\ud0dc</th><th>\uc561\uc158</th></tr>
-          {% for c in cycles %}
-          <tr>
-            <td>{{c.id}}</td><td>{{c.name}}</td><td>{{c.start_date or '-'}}</td><td>{{c.end_date or '-'}}</td><td>{{c.status}}</td>
-            <td>
-              <form method="post" style="display:inline">
-                <input type="hidden" name="action" value="delete"/>
-                <input type="hidden" name="cycle_id" value="{{c.id}}"/>
-                <button type="submit" onclick="return confirm('\uc0ad\uc81c\ud558\uc2dc\uaca0\uc2b5\ub2c8\uae4c?')">\uc0ad\uc81c</button>
-              </form>
-            </td>
-          </tr>
-          {% endfor %}
-        </table>
-        """ + FOOTER,
-        cycles=cycles,
-    )
+    return render_template_string(COMMON_STYLE + NAV_ADMIN + """
+    <h1>평가 사이클 관리</h1>
+    <div class="section">
+      <h3 style="margin-top:0;">사이클 추가</h3>
+      <form method="post">
+        <input type="hidden" name="action" value="add"/>
+        <div class="form-row">
+          <div class="form-group"><label>사이클명</label><input type="text" name="name" required/></div>
+          <div class="form-group"><label>시작일</label><input type="date" name="start_date"/></div>
+          <div class="form-group"><label>종료일</label><input type="date" name="end_date"/></div>
+        </div>
+        <button type="submit" class="btn btn-primary">추가</button>
+      </form>
+    </div>
+    <div class="section">
+      <table>
+        <tr><th>사이클명</th><th>시작일</th><th>종료일</th><th>상태</th><th>액션</th></tr>
+        {% for c in cycles %}
+        <tr>
+          <td><b>{{c.name}}</b></td><td>{{c.start_date or '-'}}</td><td>{{c.end_date or '-'}}</td><td><span class="badge badge-success">{{c.status}}</span></td>
+          <td><form method="post" style="display:inline"><input type="hidden" name="action" value="delete"/><input type="hidden" name="cycle_id" value="{{c.id}}"/>
+            <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('삭제하시겠습니까?')">삭제</button></form></td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """ + FOOTER, cycles=cycles)
 
 
 @app.route("/admin/peers", methods=["GET", "POST"])
@@ -1448,34 +1688,33 @@ def manage_peers():
                 db.commit()
         return redirect(url_for("manage_peers"))
     peers = db.execute("SELECT * FROM peer_reviewers ORDER BY id").fetchall()
-    return render_template_string(
-        COMMON_STYLE + NAV_ADMIN + """
-        <h2>\ub3d9\ub8cc\ud3c9\uac00\uc790 \uad00\ub9ac</h2>
-        <form method="post">
-          <input type="hidden" name="action" value="add"/>
-          <label>\uc774\ub984</label> <input type="text" name="name" required/>
-          <button type="submit">\ucd94\uac00</button>
-        </form>
-        <h3>\ub3d9\ub8cc\ud3c9\uac00\uc790 \ubaa9\ub85d</h3>
-        <table>
-          <tr><th>ID</th><th>\uc774\ub984</th><th>\uc561\uc158</th></tr>
-          {% for p in peers %}
-          <tr>
-            <td>{{p.id}}</td><td>{{p.name}}</td>
-            <td>
-              <form method="post" style="display:inline">
-                <input type="hidden" name="action" value="delete"/>
-                <input type="hidden" name="peer_id" value="{{p.id}}"/>
-                <button type="submit" onclick="return confirm('\uc0ad\uc81c\ud558\uc2dc\uaca0\uc2b5\ub2c8\uae4c?')">\uc0ad\uc81c</button>
-              </form>
-            </td>
-          </tr>
-          {% endfor %}
-        </table>
-        """ + FOOTER,
-        peers=peers,
-    )
+    return render_template_string(COMMON_STYLE + NAV_ADMIN + """
+    <h1>동료평가자 관리</h1>
+    <div class="section">
+      <form method="post" class="form-row" style="align-items:end;">
+        <input type="hidden" name="action" value="add"/>
+        <div class="form-group" style="flex:2;"><label>이름</label><input type="text" name="name" required/></div>
+        <div class="form-group" style="flex:0;"><button type="submit" class="btn btn-primary">추가</button></div>
+      </form>
+    </div>
+    <div class="section">
+      <table>
+        <tr><th>이름</th><th>액션</th></tr>
+        {% for p in peers %}
+        <tr>
+          <td>{{p.name}}</td>
+          <td><form method="post" style="display:inline"><input type="hidden" name="action" value="delete"/><input type="hidden" name="peer_id" value="{{p.id}}"/>
+            <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('삭제하시겠습니까?')">삭제</button></form></td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """ + FOOTER, peers=peers)
 
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 
 @app.route("/health")
 def health():
