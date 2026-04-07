@@ -3,7 +3,8 @@ import os
 import json
 import secrets
 import sqlite3
-from io import BytesIO
+import csv
+from io import BytesIO, StringIO
 from datetime import datetime, date
 from pathlib import Path
 
@@ -613,6 +614,39 @@ def get_assigned_peer_reviewers(db, evaluatee_id):
     ).fetchall()
 
 
+def is_cycle_open(db, evaluatee_id):
+    row = db.execute("""
+        SELECT c.end_date FROM evaluatees e
+        JOIN evaluation_cycles c ON c.id = e.cycle_id
+        WHERE e.id=?
+    """, (evaluatee_id,)).fetchone()
+    if not row or not row["end_date"]:
+        return True
+    return today_str() <= row["end_date"]
+
+
+def get_incomplete_users(db, evaluatees):
+    incomplete = []
+    for e in evaluatees:
+        if not e["self_submitted_at"]:
+            target = db.execute("SELECT name, email FROM users WHERE id=(SELECT user_id FROM evaluatees WHERE id=?)", (e["id"],)).fetchone()
+            if target:
+                incomplete.append({"type": "자가평가", "name": target["name"], "email": target["email"], "evaluatee_id": e["id"]})
+        assigned = db.execute("""
+            SELECT u.name, u.email, ea.evaluator_user_id
+            FROM evaluator_assignments ea JOIN users u ON u.id=ea.evaluator_user_id
+            WHERE ea.evaluatee_id=?
+        """, (e["id"],)).fetchall()
+        done_ids = {r["evaluator_user_id"] for r in db.execute(
+            "SELECT DISTINCT evaluator_user_id FROM leader_assessments WHERE evaluatee_id=? AND feedback_text IS NOT NULL AND feedback_text != ''",
+            (e["id"],),
+        ).fetchall()}
+        for a in assigned:
+            if a["evaluator_user_id"] not in done_ids:
+                incomplete.append({"type": "리더평가", "name": a["name"], "email": a["email"], "evaluatee_id": e["id"]})
+    return incomplete
+
+
 def summarize_peer_comments(db, evaluatee_id):
     rows = db.execute("SELECT peer_comment FROM peer_surveys WHERE evaluatee_id = ? ORDER BY id DESC", (evaluatee_id,)).fetchall()
     if not rows:
@@ -1116,6 +1150,11 @@ def admin_dashboard():
       <div class="stat-card"><div class="stat-value">{{total - decided}}</div><div class="stat-label">진행 중</div></div>
     </div>
 
+    <div style="margin-bottom:20px;">
+      <a href="{{url_for('export_csv')}}" class="btn btn-outline btn-sm">CSV 다운로드</a>
+      <a href="{{url_for('admin_reminder')}}" class="btn btn-outline btn-sm" style="margin-left:8px;">미완료자 리마인더</a>
+    </div>
+
     <div class="section">
       <h3 style="margin-top:0;">동료피드백 공개 정책</h3>
       <form method="post" class="form-row" style="align-items:end;">
@@ -1233,10 +1272,13 @@ def target_dashboard():
           <h2>배정된 평가가 없습니다</h2>
           <p class="subtitle">관리자에게 문의해주세요.</p>
         </div>""" + FOOTER)
+    cycle_open = is_cycle_open(db, evaluatee["id"])
     items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
     existing = db.execute("SELECT * FROM self_assessments WHERE evaluatee_id=?", (evaluatee["id"],)).fetchall()
     existing_by_item = {row["item_id"]: row for row in existing}
     if request.method == "POST":
+        if not cycle_open:
+            return redirect(url_for("target_dashboard", notice="평가 기간이 마감되어 수정할 수 없습니다."))
         file = request.files.get("presentation")
         if file and file.filename:
             UPLOAD_DIR.mkdir(exist_ok=True)
@@ -1281,6 +1323,7 @@ def target_dashboard():
     <h1>평가 대상자 화면</h1>
     <p class="subtitle">{{user.name}} · {{user.team or ''}} · {{user.email}}</p>
     {% if notice %}<div class="alert alert-success">{{notice}}</div>{% endif %}
+    {% if not cycle_open %}<div class="alert alert-warning">평가 기간이 마감되었습니다. 수정이 불가합니다.</div>{% endif %}
 
     <div class="section">
       <h3 style="margin-top:0;">내 진행 상태</h3>
@@ -1338,7 +1381,7 @@ def target_dashboard():
     </div>
     """ + FOOTER, items=items, existing=existing, existing_by_item=existing_by_item,
         result=result, evaluatee=evaluatee, user=user, dl=DECISION_LABELS, notice=notice,
-        progress=progress)
+        progress=progress, cycle_open=cycle_open)
 
 
 # ---------------------------------------------------------------------------
@@ -1361,6 +1404,8 @@ def evaluator_dashboard():
     selected = request.args.get("evaluatee_id")
     if request.method == "POST":
         evaluatee_id = request.form.get("evaluatee_id")
+        if not is_cycle_open(db, evaluatee_id):
+            return redirect(url_for("evaluator_dashboard", evaluatee_id=evaluatee_id))
         items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
         for item in items:
             db.execute("""INSERT INTO leader_assessments(evaluatee_id,evaluator_user_id,item_id,grade,feedback_text,presentation_note,qa_note,updated_at)
@@ -2175,6 +2220,132 @@ def manage_peers():
       </table>
     </div>
     """ + FOOTER, peers=peers)
+
+
+# ---------------------------------------------------------------------------
+# Admin: CSV export & reminder
+# ---------------------------------------------------------------------------
+
+@app.route("/admin/export-csv")
+@require_role("admin")
+def export_csv():
+    db = get_db()
+    evaluatees = db.execute("""
+        SELECT e.id, u.name AS target_name, u.team, u.email, c.name AS cycle_name,
+               e.self_submitted_at, ar.decision
+        FROM evaluatees e JOIN users u ON u.id=e.user_id
+        JOIN evaluation_cycles c ON c.id=e.cycle_id
+        LEFT JOIN aggregated_results ar ON ar.evaluatee_id=e.id
+        ORDER BY e.id
+    """).fetchall()
+    items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
+
+    output = StringIO()
+    writer = csv.writer(output)
+    header = ["대상자", "팀", "이메일", "사이클", "자가평가 제출"]
+    for item in items:
+        header.append(f"자가-{item['title']}")
+        header.append(f"리더종합-{item['title']}")
+    header += ["판정", "진행 상태"]
+    writer.writerow(header)
+
+    for e in evaluatees:
+        self_grades = db.execute("SELECT item_id, grade FROM self_assessments WHERE evaluatee_id=?", (e["id"],)).fetchall()
+        self_map = {r["item_id"]: r["grade"] for r in self_grades}
+        item_grades = get_item_grades_for_evaluatee(db, e["id"])
+        progress = get_evaluatee_progress(db, e["id"])
+        row = [e["target_name"], e["team"] or "", e["email"], e["cycle_name"], e["self_submitted_at"] or "미제출"]
+        for item in items:
+            row.append(self_map.get(item["id"], ""))
+            row.append(item_grades.get(item["id"], ""))
+        row.append(DECISION_LABELS.get(e["decision"] or "IN_PROGRESS", e["decision"] or "진행 중"))
+        row.append(progress["status"])
+        writer.writerow(row)
+
+    csv_bytes = output.getvalue().encode("utf-8-sig")
+    return Response(
+        csv_bytes,
+        mimetype="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="evaluation_export_{today_str()}.csv"'},
+    )
+
+
+@app.route("/admin/reminder")
+@require_role("admin")
+def admin_reminder():
+    db = get_db()
+    evaluatees = db.execute("""
+        SELECT e.id, e.self_submitted_at, ar.decision
+        FROM evaluatees e
+        LEFT JOIN aggregated_results ar ON ar.evaluatee_id = e.id
+        ORDER BY e.id
+    """).fetchall()
+    incomplete = get_incomplete_users(db, evaluatees)
+    emails = list({u["email"] for u in incomplete})
+    return render_template_string(COMMON_STYLE + NAV_ADMIN + """
+    <h1>미완료자 리마인더</h1>
+    <p class="subtitle">아직 평가를 완료하지 않은 사용자 목록입니다</p>
+
+    <div class="section">
+      <h3 style="margin-top:0;">미완료자 이메일 (복사용)</h3>
+      <textarea rows="3" style="width:100%;font-size:13px;" readonly onclick="this.select()">{{emails_str}}</textarea>
+      <p style="font-size:12px;color:var(--gray-400);margin-top:6px;">위 텍스트를 클릭하면 전체 선택됩니다. 복사 후 메일 수신인에 붙여넣기 하세요.</p>
+    </div>
+
+    <div class="section">
+      <h3 style="margin-top:0;">미완료 상세 목록</h3>
+      <table>
+        <tr><th>이름</th><th>이메일</th><th>미완료 항목</th></tr>
+        {% for u in incomplete %}
+        <tr>
+          <td><b>{{u.name}}</b></td>
+          <td style="font-size:13px;">{{u.email}}</td>
+          <td><span class="badge badge-warning">{{u.type}}</span></td>
+        </tr>
+        {% endfor %}
+        {% if not incomplete %}<tr><td colspan="3" style="text-align:center;color:var(--gray-400);">모든 사용자가 평가를 완료했습니다.</td></tr>{% endif %}
+      </table>
+    </div>
+
+    <a href="{{url_for('admin_dashboard')}}" class="btn btn-outline">돌아가기</a>
+    """ + FOOTER, incomplete=incomplete, emails_str="; ".join(emails))
+
+
+# ---------------------------------------------------------------------------
+# Error handlers
+# ---------------------------------------------------------------------------
+
+@app.errorhandler(403)
+def forbidden(e):
+    return render_template_string(COMMON_STYLE + """
+    <div style="text-align:center;margin-top:80px;">
+      <div style="font-size:64px;margin-bottom:16px;">🚫</div>
+      <h1 style="border:none;">접근 권한이 없습니다</h1>
+      <p class="subtitle">이 페이지에 접근할 권한이 없습니다.</p>
+      <a href="/" class="btn btn-primary" style="text-decoration:none;">홈으로 돌아가기</a>
+    </div>""" + FOOTER), 403
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return render_template_string(COMMON_STYLE + """
+    <div style="text-align:center;margin-top:80px;">
+      <div style="font-size:64px;margin-bottom:16px;">🔍</div>
+      <h1 style="border:none;">페이지를 찾을 수 없습니다</h1>
+      <p class="subtitle">요청하신 페이지가 존재하지 않습니다.</p>
+      <a href="/" class="btn btn-primary" style="text-decoration:none;">홈으로 돌아가기</a>
+    </div>""" + FOOTER), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return render_template_string(COMMON_STYLE + """
+    <div style="text-align:center;margin-top:80px;">
+      <div style="font-size:64px;margin-bottom:16px;">⚠️</div>
+      <h1 style="border:none;">서버 오류가 발생했습니다</h1>
+      <p class="subtitle">잠시 후 다시 시도해 주세요. 문제가 지속되면 관리자에게 문의해 주세요.</p>
+      <a href="/" class="btn btn-primary" style="text-decoration:none;">홈으로 돌아가기</a>
+    </div>""" + FOOTER), 500
 
 
 # ---------------------------------------------------------------------------
