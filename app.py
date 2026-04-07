@@ -308,6 +308,10 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS peer_reviewers (id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id SERIAL PRIMARY KEY, evaluatee_id INTEGER, actor_user_id INTEGER,
+            action TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL
+        );
         """
     else:
         schema_script = """
@@ -362,6 +366,10 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS peer_reviewers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER, actor_user_id INTEGER,
+            action TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL
+        );
         """
     db.executescript(schema_script)
 
@@ -450,14 +458,24 @@ def current_user():
     return get_db().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
+def row_value(row, key, default=None):
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    if hasattr(row, "keys") and key in row.keys():
+        return row[key]
+    return default
+
+
 def is_within_access_period(user):
     if not user:
         return False
     if user["role"] == "admin":
         return True
     t = today_str()
-    start = user.get("access_start") or user["access_start"] if "access_start" in (user.keys() if hasattr(user, "keys") else []) else None
-    end = user.get("access_end") or user["access_end"] if "access_end" in (user.keys() if hasattr(user, "keys") else []) else None
+    start = row_value(user, "access_start")
+    end = row_value(user, "access_end")
     if start and t < start:
         return False
     if end and t > end:
@@ -490,6 +508,85 @@ def require_role(role=None):
 # ---------------------------------------------------------------------------
 # Business logic helpers
 # ---------------------------------------------------------------------------
+
+def log_action(db, action, evaluatee_id=None, actor_user_id=None, detail=""):
+    db.execute(
+        "INSERT INTO audit_logs(evaluatee_id, actor_user_id, action, detail, created_at) VALUES (?,?,?,?,?)",
+        (evaluatee_id, actor_user_id, action, detail, now()),
+    )
+
+
+def get_evaluatee_progress(db, evaluatee_id):
+    evaluatee = db.execute(
+        "SELECT self_submitted_at FROM evaluatees WHERE id=?",
+        (evaluatee_id,),
+    ).fetchone()
+    self_done = bool(evaluatee and evaluatee["self_submitted_at"])
+    assigned_count_row = db.execute(
+        "SELECT COUNT(*) AS count FROM evaluator_assignments WHERE evaluatee_id=?",
+        (evaluatee_id,),
+    ).fetchone()
+    assigned_count = row_value(assigned_count_row, "count", 0) or 0
+    evaluator_done = db.execute(
+        """
+        SELECT COUNT(DISTINCT evaluator_user_id) AS count
+        FROM leader_assessments
+        WHERE evaluatee_id=? AND feedback_text IS NOT NULL AND feedback_text != ''
+        """,
+        (evaluatee_id,),
+    ).fetchone()
+    evaluator_done_count = row_value(evaluator_done, "count", 0) or 0
+    result = db.execute(
+        "SELECT decision, delivered_at FROM aggregated_results WHERE evaluatee_id=?",
+        (evaluatee_id,),
+    ).fetchone()
+    aggregated = bool(result)
+    delivered = bool(result and result["delivered_at"])
+
+    if delivered:
+        status = "전달 완료"
+    elif aggregated:
+        status = "취합 완료"
+    elif evaluator_done_count and assigned_count and evaluator_done_count >= assigned_count:
+        status = "평가 완료"
+    elif self_done:
+        status = "리더 평가 중"
+    else:
+        status = "자가평가 대기"
+
+    progress_score = 0
+    if self_done:
+        progress_score += 1
+    if evaluator_done_count:
+        progress_score += 1
+    if aggregated:
+        progress_score += 1
+    if delivered:
+        progress_score += 1
+    return {
+        "status": status,
+        "self_done": self_done,
+        "assigned_count": assigned_count,
+        "evaluator_done_count": evaluator_done_count,
+        "aggregated": aggregated,
+        "delivered": delivered,
+        "progress_score": progress_score,
+    }
+
+
+def get_audit_logs_for_evaluatee(db, evaluatee_id, limit=20):
+    return db.execute(
+        """
+        SELECT al.*, u.name AS actor_name
+        FROM audit_logs al
+        LEFT JOIN users u ON u.id = al.actor_user_id
+        WHERE al.evaluatee_id=?
+        ORDER BY al.id DESC
+        LIMIT ?
+        """,
+        (evaluatee_id, limit),
+    ).fetchall()
+
 
 def summarize_peer_comments(db, evaluatee_id):
     rows = db.execute("SELECT peer_comment FROM peer_surveys WHERE evaluatee_id = ? ORDER BY id DESC", (evaluatee_id,)).fetchall()
@@ -803,15 +900,17 @@ def admin_dashboard():
         target_user_id = request.form.get("target_user_id")
         cycle_id = request.form.get("cycle_id")
         evaluator_ids = request.form.getlist("evaluator_ids")[:3]
-        relationships = request.form.getlist("relationships")
         cursor = db.execute("INSERT INTO evaluatees(user_id,cycle_id,peer_survey_token,created_at) VALUES (?,?,?,?) RETURNING id",
                             (target_user_id, cycle_id, secrets.token_hex(8), now()))
         inserted = cursor.fetchone()
         evaluatee_id = inserted["id"] if hasattr(inserted, "keys") else inserted[0]
-        for i, evaluator_id in enumerate(evaluator_ids):
-            rel = relationships[i] if i < len(relationships) else "direct_leader"
+        for evaluator_id in evaluator_ids:
+            rel = request.form.get(f"relationship_{evaluator_id}", "direct_leader")
+            if rel not in RELATIONSHIP_OPTIONS:
+                rel = "direct_leader"
             db.execute("INSERT INTO evaluator_assignments(evaluatee_id,evaluator_user_id,relationship) VALUES (?,?,?) ON CONFLICT(evaluatee_id,evaluator_user_id) DO UPDATE SET relationship=excluded.relationship",
                        (evaluatee_id, evaluator_id, rel))
+        log_action(db, "assignment_created", evaluatee_id=evaluatee_id, actor_user_id=current_user()["id"], detail=f"평가자 {len(evaluator_ids)}명 배정")
         db.commit()
         return redirect(url_for("admin_dashboard"))
 
@@ -831,6 +930,7 @@ def admin_dashboard():
     total = len(evaluatees)
     submitted = sum(1 for e in evaluatees if e["self_submitted_at"])
     decided = sum(1 for e in evaluatees if e["decision"] and e["decision"] != "IN_PROGRESS")
+    progress_map = {e["id"]: get_evaluatee_progress(db, e["id"]) for e in evaluatees}
 
     return render_template_string(COMMON_STYLE + NAV_ADMIN + """
     <h1>관리자 대시보드</h1>
@@ -878,7 +978,7 @@ def admin_dashboard():
             <label style="margin:0;display:flex;align-items:center;gap:6px;min-width:180px;">
               <input type="checkbox" name="evaluator_ids" value="{{e.id}}"> {{e.name}} <span style="color:var(--gray-400);font-weight:400;">({{e.team or '-'}})</span>
             </label>
-            <select name="relationships" style="width:auto;padding:6px 10px;">
+            <select name="relationship_{{e.id}}" style="width:auto;padding:6px 10px;">
               {% for rk, rl in rel_options.items() %}<option value="{{rk}}">{{rl}}</option>{% endfor %}
             </select>
           </div>
@@ -891,12 +991,20 @@ def admin_dashboard():
     <div class="section">
       <h3 style="margin-top:0;">대상자 목록</h3>
       <table>
-        <tr><th>대상자</th><th>팀</th><th>사이클</th><th>자가평가</th><th>판정</th><th>동료설문</th><th>액션</th></tr>
+        <tr><th>대상자</th><th>팀</th><th>사이클</th><th>진행 상태</th><th>자가평가</th><th>판정</th><th>동료설문</th><th>액션</th></tr>
         {% for e in evaluatees %}
         <tr>
           <td><b>{{e.target_name}}</b></td>
           <td>{{e.target_team or '-'}}</td>
           <td>{{e.cycle_name}}</td>
+          <td>
+            {% set p = progress_map[e.id] %}
+            {% if p.delivered %}<span class="badge badge-success">{{p.status}}</span>
+            {% elif p.aggregated %}<span class="badge badge-info">{{p.status}}</span>
+            {% elif p.evaluator_done_count %}<span class="badge badge-warning">{{p.status}}</span>
+            {% else %}<span class="badge badge-gray">{{p.status}}</span>{% endif %}
+            <div style="font-size:11px;color:var(--gray-400);margin-top:4px;">평가자 {{p.evaluator_done_count}} / {{p.assigned_count}}</div>
+          </td>
           <td>{% if e.self_submitted_at %}<span class="badge badge-success">완료</span>{% else %}<span class="badge badge-gray">미제출</span>{% endif %}</td>
           <td>{% set d = e.decision or 'IN_PROGRESS' %}
               {% if d == 'SUPER_PASS' %}<span class="badge badge-success">{{dl[d]}}</span>
@@ -917,7 +1025,8 @@ def admin_dashboard():
     """ + FOOTER, targets=targets, evaluators=evaluators, cycles=cycles,
         evaluatees=evaluatees, peer_visibility=peer_visibility,
         pv_options=PEER_VISIBILITY_OPTIONS, dl=DECISION_LABELS,
-        rel_options=RELATIONSHIP_OPTIONS, total=total, submitted=submitted, decided=decided)
+        rel_options=RELATIONSHIP_OPTIONS, total=total, submitted=submitted, decided=decided,
+        progress_map=progress_map)
 
 
 # ---------------------------------------------------------------------------
@@ -976,13 +1085,25 @@ def target_dashboard():
                 try_text=excluded.try_text, updated_at=excluded.updated_at""",
                        (evaluatee["id"], item["id"], grade, keep_text, problem_text, try_text, now()))
         db.execute("UPDATE evaluatees SET self_submitted_at=? WHERE id=?", (now(), evaluatee["id"]))
+        log_action(db, "self_assessment_saved", evaluatee_id=evaluatee["id"], actor_user_id=user["id"], detail="자가평가 및 발표자료 저장")
         db.commit()
         return redirect(url_for("target_dashboard", notice=notice))
     result = db.execute("SELECT * FROM aggregated_results WHERE evaluatee_id=?", (evaluatee["id"],)).fetchone()
+    progress = get_evaluatee_progress(db, evaluatee["id"])
     return render_template_string(COMMON_STYLE + NAV_TARGET + """
     <h1>평가 대상자 화면</h1>
     <p class="subtitle">{{user.name}} · {{user.team or ''}} · {{user.email}}</p>
     {% if notice %}<div class="alert alert-success">{{notice}}</div>{% endif %}
+
+    <div class="section">
+      <h3 style="margin-top:0;">내 진행 상태</h3>
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-value">{{progress.progress_score}}/4</div><div class="stat-label">전체 진행도</div></div>
+        <div class="stat-card"><div class="stat-value">{{'완료' if progress.self_done else '대기'}}</div><div class="stat-label">자가평가</div></div>
+        <div class="stat-card"><div class="stat-value">{{progress.evaluator_done_count}}/{{progress.assigned_count}}</div><div class="stat-label">리더 평가</div></div>
+        <div class="stat-card"><div class="stat-value">{{progress.status}}</div><div class="stat-label">현재 단계</div></div>
+      </div>
+    </div>
 
     <div class="section">
       <h3 style="margin-top:0;">PT 업로드 + 자가평가</h3>
@@ -1029,7 +1150,8 @@ def target_dashboard():
       {% endif %}
     </div>
     """ + FOOTER, items=items, existing=existing, existing_by_item=existing_by_item,
-        result=result, evaluatee=evaluatee, user=user, dl=DECISION_LABELS, notice=notice)
+        result=result, evaluatee=evaluatee, user=user, dl=DECISION_LABELS, notice=notice,
+        progress=progress)
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1185,7 @@ def evaluator_dashboard():
                         request.form.get("feedback_text", ""),
                         request.form.get("presentation_note", ""),
                         request.form.get("qa_note", ""), now()))
+        log_action(db, "leader_assessment_saved", evaluatee_id=evaluatee_id, actor_user_id=user["id"], detail="리더 평가 저장")
         db.commit()
         return redirect(url_for("evaluator_dashboard", evaluatee_id=evaluatee_id))
     detail = None; self_data = []; items = []; leader_data = {}; peer_summary = ""; ai_questions = ""
@@ -1087,6 +1210,7 @@ def evaluator_dashboard():
         ai_row = db.execute("SELECT suggested_questions FROM ai_question_logs WHERE evaluatee_id=? AND evaluator_user_id=? ORDER BY id DESC LIMIT 1", (selected, user["id"])).fetchone()
         if ai_row:
             ai_questions = ai_row["suggested_questions"]
+    progress = get_evaluatee_progress(db, detail["id"]) if detail else None
     return render_template_string(COMMON_STYLE + NAV_EVALUATOR + """
     <h1>평가자 화면</h1>
     <p class="subtitle">{{user.name}} · {{user.team or ''}} · {{user.email}}</p>
@@ -1108,6 +1232,15 @@ def evaluator_dashboard():
     </div>
 
     {% if detail %}
+    <div class="section">
+      <h3 style="margin-top:0;">진행 현황</h3>
+      <div class="stat-grid">
+        <div class="stat-card"><div class="stat-value">{{progress.status}}</div><div class="stat-label">현재 단계</div></div>
+        <div class="stat-card"><div class="stat-value">{{'완료' if progress.self_done else '대기'}}</div><div class="stat-label">자가평가</div></div>
+        <div class="stat-card"><div class="stat-value">{{progress.evaluator_done_count}}/{{progress.assigned_count}}</div><div class="stat-label">평가자 제출</div></div>
+        <div class="stat-card"><div class="stat-value">{{'완료' if progress.delivered else '미전달'}}</div><div class="stat-label">최종 전달</div></div>
+      </div>
+    </div>
     <div class="section">
       <h3 style="margin-top:0;">{{detail.target_name}} <span style="font-weight:400;color:var(--gray-400);">{{detail.target_team or ''}}</span></h3>
       <p style="margin-bottom:12px;">PT 파일: {% if detail.presentation_filename %}<a href="{{url_for('presentation_file', evaluatee_id=detail.id)}}">{{detail.presentation_filename}}</a>{% else %}미업로드{% endif %}</p>
@@ -1164,6 +1297,7 @@ def evaluator_dashboard():
     """ + FOOTER, assignments=assignments, detail=detail, self_data=self_data,
         items=items, leader_data=leader_data, peer_summary=peer_summary,
         ai_questions=ai_questions, user=user, selected=selected,
+        progress=progress,
         rel_labels=RELATIONSHIP_OPTIONS)
 
 
@@ -1178,6 +1312,7 @@ def ai_questions(evaluatee_id):
     suggested = build_ai_questions(source_note)
     db.execute("INSERT INTO ai_question_logs(evaluatee_id,evaluator_user_id,source_note,suggested_questions,created_at) VALUES (?,?,?,?,?)",
                (evaluatee_id, user["id"], source_note, suggested, now()))
+    log_action(db, "ai_questions_generated", evaluatee_id=evaluatee_id, actor_user_id=user["id"], detail="AI 질문 생성")
     db.commit()
     return redirect(url_for("evaluator_dashboard", evaluatee_id=evaluatee_id))
 
@@ -1203,6 +1338,7 @@ def peer_survey(token):
                 peer_name = peer_row["name"]
         if comment:
             db.execute("INSERT INTO peer_surveys(evaluatee_id,peer_name,peer_comment,created_at) VALUES (?,?,?,?)", (evaluatee["id"], peer_name, comment, now()))
+            log_action(db, "peer_survey_submitted", evaluatee_id=evaluatee["id"], actor_user_id=None, detail=f"동료 평가 제출: {peer_name or '익명'}")
             db.commit()
             return render_template_string(COMMON_STYLE + """
             <div style="text-align:center;margin-top:80px;">
@@ -1305,6 +1441,8 @@ def aggregate_result(evaluatee_id):
         VALUES (?,?,?,?) ON CONFLICT(evaluatee_id) DO UPDATE SET
         decision=excluded.decision, summary=excluded.summary, updated_at=excluded.updated_at""",
                (evaluatee_id, decision, summary, now()))
+    actor = current_user()
+    log_action(db, "result_aggregated", evaluatee_id=evaluatee_id, actor_user_id=actor["id"] if actor else None, detail=f"판정: {decision}")
     db.commit()
     return redirect(url_for("admin_dashboard"))
 
@@ -1320,11 +1458,17 @@ def deliver_feedback(evaluatee_id):
     target_name = target_info["name"] if target_info else "대상자"
 
     all_feedbacks = db.execute("""
-        SELECT DISTINCT la.feedback_text, u.name AS evaluator_name, ea.relationship
+        SELECT la.evaluator_user_id,
+               MAX(la.feedback_text) AS feedback_text,
+               MAX(la.updated_at) AS updated_at,
+               u.name AS evaluator_name,
+               ea.relationship
         FROM leader_assessments la
         JOIN users u ON u.id = la.evaluator_user_id
         JOIN evaluator_assignments ea ON ea.evaluatee_id = la.evaluatee_id AND ea.evaluator_user_id = la.evaluator_user_id
         WHERE la.evaluatee_id = ? AND la.feedback_text IS NOT NULL AND la.feedback_text != ''
+        GROUP BY la.evaluator_user_id, u.name, ea.relationship
+        ORDER BY MAX(la.updated_at) DESC
     """, (evaluatee_id,)).fetchall()
     raw_feedbacks = "\n\n".join([f"[{RELATIONSHIP_OPTIONS.get(f['relationship'], f['relationship'])} - {f['evaluator_name']}]\n{f['feedback_text']}" for f in all_feedbacks])
 
@@ -1333,11 +1477,15 @@ def deliver_feedback(evaluatee_id):
         if action == "ai_polish":
             polished = polish_feedback_with_ai(raw_feedbacks, target_name)
             db.execute("UPDATE aggregated_results SET ai_polished_feedback=?, updated_at=? WHERE evaluatee_id=?", (polished, now(), evaluatee_id))
+            actor = current_user()
+            log_action(db, "feedback_ai_polished", evaluatee_id=evaluatee_id, actor_user_id=actor["id"] if actor else None, detail="AI 종합 피드백 정리")
             db.commit()
             return redirect(url_for("deliver_feedback", evaluatee_id=evaluatee_id))
         admin_feedback = request.form.get("admin_feedback", "")
         db.execute("UPDATE aggregated_results SET admin_feedback=?, delivered_at=?, updated_at=? WHERE evaluatee_id=?",
                    (admin_feedback, now(), now(), evaluatee_id))
+        actor = current_user()
+        log_action(db, "feedback_delivered", evaluatee_id=evaluatee_id, actor_user_id=actor["id"] if actor else None, detail="최종 피드백 전달")
         db.commit()
         return redirect(url_for("admin_dashboard"))
 
@@ -1418,6 +1566,8 @@ def admin_report(evaluatee_id):
     item_grades = get_item_grades_for_evaluatee(db, evaluatee_id)
     evaluators_info = db.execute("""SELECT u.name, u.team, ea.relationship FROM evaluator_assignments ea
         JOIN users u ON u.id=ea.evaluator_user_id WHERE ea.evaluatee_id=?""", (evaluatee_id,)).fetchall()
+    progress = get_evaluatee_progress(db, evaluatee_id)
+    timeline = get_audit_logs_for_evaluatee(db, evaluatee_id, limit=30)
 
     return render_template_string(COMMON_STYLE + NAV_ADMIN + """
     <div class="no-print" style="margin-bottom:16px;">
@@ -1435,6 +1585,7 @@ def admin_report(evaluatee_id):
       <table>
         <tr><th style="width:140px;">이름</th><td>{{evaluatee.target_name}}</td><th style="width:140px;">팀</th><td>{{evaluatee.target_team or '-'}}</td></tr>
         <tr><th>이메일</th><td>{{evaluatee.target_email}}</td><th>자가평가 제출</th><td>{{evaluatee.self_submitted_at or '미제출'}}</td></tr>
+        <tr><th>현재 단계</th><td>{{progress.status}}</td><th>평가자 제출</th><td>{{progress.evaluator_done_count}} / {{progress.assigned_count}}</td></tr>
       </table>
     </div>
 
@@ -1507,10 +1658,22 @@ def admin_report(evaluatee_id):
     </div>
     {% endif %}
 
+    <div class="section">
+      <h3 style="margin-top:0;">운영 타임라인</h3>
+      {% for log in timeline %}
+      <div class="card">
+        <b>{{log.created_at}}</b>
+        <span class="badge badge-info" style="margin-left:8px;">{{log.action}}</span>
+        <div style="font-size:13px;color:var(--gray-600);margin-top:6px;">{{log.actor_name or '시스템'}}{% if log.detail %} · {{log.detail}}{% endif %}</div>
+      </div>
+      {% endfor %}
+      {% if not timeline %}<p style="color:var(--gray-400);">기록된 타임라인이 없습니다.</p>{% endif %}
+    </div>
+
     <p style="text-align:center;color:var(--gray-400);font-size:12px;margin-top:32px;">생성일: {{now}} | 수습평가 시스템</p>
     """ + FOOTER, evaluatee=evaluatee, items=items, self_data=self_data,
         leader_rows=leader_rows, peer_surveys=peer_surveys, result=result,
-        item_grades=item_grades, evaluators_info=evaluators_info,
+        item_grades=item_grades, evaluators_info=evaluators_info, progress=progress, timeline=timeline,
         dl=DECISION_LABELS, rel_labels=RELATIONSHIP_OPTIONS, now=now())
 
 
@@ -1537,6 +1700,8 @@ def manage_users():
                     password = {"target": "target1234", "evaluator": "leader1234", "admin": "admin1234"}.get(role, "pass1234")
                 db.execute("INSERT INTO users(name, email, role, password_hash, team, access_start, access_end) VALUES (?,?,?,?,?,?,?)",
                            (name, email, role, generate_password_hash(password), team, access_start, access_end))
+                actor = current_user()
+                log_action(db, "user_added", actor_user_id=actor["id"] if actor else None, detail=f"{name} / {role}")
                 db.commit()
         elif action == "update_access":
             user_id = request.form.get("user_id")
@@ -1545,17 +1710,23 @@ def manage_users():
             team = request.form.get("team", "").strip()
             if user_id:
                 db.execute("UPDATE users SET access_start=?, access_end=?, team=? WHERE id=?", (access_start, access_end, team, user_id))
+                actor = current_user()
+                log_action(db, "user_access_updated", actor_user_id=actor["id"] if actor else None, detail=f"user_id={user_id}")
                 db.commit()
         elif action == "reset_password":
             user_id = request.form.get("user_id")
             new_password = request.form.get("new_password", "").strip()
             if user_id and new_password:
                 db.execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(new_password), user_id))
+                actor = current_user()
+                log_action(db, "user_password_reset", actor_user_id=actor["id"] if actor else None, detail=f"user_id={user_id}")
                 db.commit()
         elif action == "delete":
             user_id = request.form.get("user_id")
             if user_id:
                 db.execute("DELETE FROM users WHERE id=?", (user_id,))
+                actor = current_user()
+                log_action(db, "user_deleted", actor_user_id=actor["id"] if actor else None, detail=f"user_id={user_id}")
                 db.commit()
         return redirect(url_for("manage_users"))
     users = db.execute("SELECT * FROM users ORDER BY role, id").fetchall()
@@ -1633,11 +1804,15 @@ def manage_cycles():
             end_date = request.form.get("end_date", "")
             if name:
                 db.execute("INSERT INTO evaluation_cycles(name, start_date, end_date) VALUES (?,?,?)", (name, start_date, end_date))
+                actor = current_user()
+                log_action(db, "cycle_added", actor_user_id=actor["id"] if actor else None, detail=name)
                 db.commit()
         elif action == "delete":
             cycle_id = request.form.get("cycle_id")
             if cycle_id:
                 db.execute("DELETE FROM evaluation_cycles WHERE id=?", (cycle_id,))
+                actor = current_user()
+                log_action(db, "cycle_deleted", actor_user_id=actor["id"] if actor else None, detail=f"cycle_id={cycle_id}")
                 db.commit()
         return redirect(url_for("manage_cycles"))
     cycles = db.execute("SELECT * FROM evaluation_cycles ORDER BY id DESC").fetchall()
@@ -1680,11 +1855,15 @@ def manage_peers():
             name = request.form.get("name", "").strip()
             if name:
                 db.execute("INSERT INTO peer_reviewers(name) VALUES (?) ON CONFLICT(name) DO NOTHING", (name,))
+                actor = current_user()
+                log_action(db, "peer_reviewer_added", actor_user_id=actor["id"] if actor else None, detail=name)
                 db.commit()
         elif action == "delete":
             peer_id = request.form.get("peer_id")
             if peer_id:
                 db.execute("DELETE FROM peer_reviewers WHERE id=?", (peer_id,))
+                actor = current_user()
+                log_action(db, "peer_reviewer_deleted", actor_user_id=actor["id"] if actor else None, detail=f"peer_id={peer_id}")
                 db.commit()
         return redirect(url_for("manage_peers"))
     peers = db.execute("SELECT * FROM peer_reviewers ORDER BY id").fetchall()
