@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env
+.venv/
+venv/
+
+uploads/
+probation_eval.db
+
+.DS_Store
+Thumbs.db
+desktop.ini
