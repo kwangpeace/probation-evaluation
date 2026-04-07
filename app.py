@@ -1239,10 +1239,11 @@ def admin_dashboard():
             <div style="font-size:11px;color:var(--gray-400);margin-top:4px;">배정 {{e.peer_feedback_count}}명</div>
           </td>
           <td>
+            <a href="{{url_for('admin_evaluator_detail', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">평가상세</a>
             <a href="{{url_for('aggregate_result', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">취합</a>
             <a href="{{url_for('deliver_feedback', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">전달</a>
             <a href="{{url_for('admin_report', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">리포트</a>
-            <a href="{{url_for('manage_peer_feedback_assignments', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">동료피드백 배정</a>
+            <a href="{{url_for('manage_peer_feedback_assignments', evaluatee_id=e.id)}}" class="btn btn-outline btn-sm">동료피드백</a>
           </td>
         </tr>
         {% endfor %}
@@ -1490,6 +1491,30 @@ def evaluator_dashboard():
       {% endfor %}
       {% endif %}
 
+      <div class="section" style="background:var(--primary-light);border-color:var(--primary);">
+        <h3 style="margin-top:0;color:var(--primary);">평가 작성 가이드</h3>
+        <div style="font-size:13px;line-height:1.9;color:var(--gray-700);">
+          <p><b>등급 기준 안내</b></p>
+          <ul style="padding-left:20px;">
+            <li><b>S등급:</b> 기대를 크게 초과한 탁월한 성과. 역할 범위를 넘어 조직에 결정적 기여</li>
+            <li><b>A등급:</b> 기대를 충족한 우수한 성과. 합의된 목표를 충실히 달성</li>
+            <li><b>B등급:</b> 부분적 달성. 일부 보완이 필요하며 지속적 가이드가 요구됨</li>
+            <li><b>C등급:</b> 기대에 미달. 목표 달성 부족 또는 반복적 개선 필요</li>
+          </ul>
+          <p style="margin-top:12px;"><b>서술 피드백 작성 요령</b></p>
+          <ul style="padding-left:20px;">
+            <li>관찰한 <b>구체적 행동과 사례</b>를 중심으로 기술해 주세요</li>
+            <li><b>잘한 점(강점)</b>과 <b>개선 필요 사항</b>을 균형 있게 포함해 주세요</li>
+            <li>개선 필요 사항은 <b>구체적 대안/방향</b>을 함께 제시해 주세요</li>
+            <li>존중하는 톤으로 작성해 주세요</li>
+          </ul>
+          <div class="alert alert-warning" style="margin-top:12px;">
+            <b>중요:</b> 아래 '대상자 전달 피드백'에 작성하신 내용은 <b>대상자에게 그대로 전달</b>됩니다.
+            대상자가 읽는다는 점을 고려하여 건설적이고 구체적으로 작성해 주세요.
+          </div>
+        </div>
+      </div>
+
       <h3>리더 평가</h3>
       <form method="post">
         <input type="hidden" name="evaluatee_id" value="{{detail.id}}"/>
@@ -1510,9 +1535,12 @@ def evaluator_dashboard():
           </div>
         </div>
         {% endfor %}
-        <div class="form-group"><label>PT 메모</label><textarea name="presentation_note" rows="3">{{ leader_data.values()|list|first.presentation_note if leader_data else '' }}</textarea></div>
-        <div class="form-group"><label>Q&A 메모</label><textarea name="qa_note" rows="3">{{ leader_data.values()|list|first.qa_note if leader_data else '' }}</textarea></div>
-        <div class="form-group"><label>대상자 전달 피드백</label><textarea name="feedback_text" rows="4">{{ leader_data.values()|list|first.feedback_text if leader_data else '' }}</textarea></div>
+        <div class="form-group"><label>PT 발표 메모 <span style="font-weight:400;color:var(--gray-400);">(관리자 참고용, 대상자 비공개)</span></label><textarea name="presentation_note" rows="3">{{ leader_data.values()|list|first.presentation_note if leader_data else '' }}</textarea></div>
+        <div class="form-group"><label>Q&A 메모 <span style="font-weight:400;color:var(--gray-400);">(관리자 참고용, 대상자 비공개)</span></label><textarea name="qa_note" rows="3">{{ leader_data.values()|list|first.qa_note if leader_data else '' }}</textarea></div>
+        <div class="form-group">
+          <label>대상자 전달 피드백 <span style="font-weight:400;color:var(--danger);">⚠ 대상자에게 그대로 전달됩니다</span></label>
+          <textarea name="feedback_text" rows="6" placeholder="대상자의 성장을 돕기 위한 구체적 피드백을 작성해 주세요.&#10;&#10;작성 예시:&#10;[잘한 점] ○○ 프로젝트에서 주도적으로 일정을 관리하며...&#10;[개선 필요] 팀 내 커뮤니케이션에서 진행상황 공유가...&#10;[제안] 주 1회 간단한 진행 공유를 하시면...">{{ leader_data.values()|list|first.feedback_text if leader_data else '' }}</textarea>
+        </div>
         <button type="submit" class="btn btn-primary">저장</button>
       </form>
     </div>
@@ -1659,8 +1687,99 @@ def presentation_file(evaluatee_id):
 
 
 # ---------------------------------------------------------------------------
-# Admin: aggregate & deliver
+# Admin: evaluator detail view & aggregate & deliver
 # ---------------------------------------------------------------------------
+
+@app.route("/admin/evaluator-detail/<int:evaluatee_id>")
+@require_role("admin")
+def admin_evaluator_detail(evaluatee_id):
+    db = get_db()
+    evaluatee = db.execute("""
+        SELECT e.id, u.name AS target_name, u.team AS target_team, c.name AS cycle_name
+        FROM evaluatees e JOIN users u ON u.id=e.user_id JOIN evaluation_cycles c ON c.id=e.cycle_id
+        WHERE e.id=?
+    """, (evaluatee_id,)).fetchone()
+    if not evaluatee:
+        abort(404)
+    items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
+    evaluators = db.execute("""
+        SELECT ea.evaluator_user_id, u.name, u.team, ea.relationship
+        FROM evaluator_assignments ea JOIN users u ON u.id=ea.evaluator_user_id
+        WHERE ea.evaluatee_id=?
+    """, (evaluatee_id,)).fetchall()
+
+    evaluator_assessments = {}
+    for ev in evaluators:
+        rows = db.execute("""
+            SELECT la.*, ai.title AS item_title
+            FROM leader_assessments la
+            JOIN assessment_items ai ON ai.id=la.item_id
+            WHERE la.evaluatee_id=? AND la.evaluator_user_id=?
+            ORDER BY ai.id
+        """, (evaluatee_id, ev["evaluator_user_id"])).fetchall()
+        evaluator_assessments[ev["evaluator_user_id"]] = rows
+
+    item_grades = get_item_grades_for_evaluatee(db, evaluatee_id)
+    peer_surveys = db.execute("SELECT * FROM peer_surveys WHERE evaluatee_id=? ORDER BY id", (evaluatee_id,)).fetchall()
+
+    return render_template_string(COMMON_STYLE + NAV_ADMIN + """
+    <h1>평가자별 상세 조회</h1>
+    <p class="subtitle">{{evaluatee.target_name}} · {{evaluatee.target_team or '-'}} · {{evaluatee.cycle_name}}</p>
+
+    <div class="section">
+      <h3 style="margin-top:0;">종합 등급</h3>
+      <table>
+        <tr><th>평가항목</th><th>종합 등급</th></tr>
+        {% for item in items %}
+        <tr><td>{{item.title}}</td><td><span class="badge badge-info">{{item_grades.get(item.id, 'N/A')}}</span></td></tr>
+        {% endfor %}
+      </table>
+    </div>
+
+    {% for ev in evaluators %}
+    <div class="section">
+      <h3 style="margin-top:0;">
+        {{ev.name}} <span style="font-weight:400;color:var(--gray-400);">{{ev.team or ''}}</span>
+        <span class="badge badge-info" style="margin-left:8px;">{{rel_labels.get(ev.relationship, ev.relationship)}}</span>
+      </h3>
+      {% set rows = evaluator_assessments.get(ev.evaluator_user_id, []) %}
+      {% if rows %}
+        {% for la in rows %}
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <b>{{la.item_title}}</b>
+            <span class="badge {% if la.grade == 'S' %}badge-success{% elif la.grade == 'A' %}badge-info{% elif la.grade == 'B' %}badge-warning{% else %}badge-danger{% endif %}" style="font-size:14px;">{{la.grade}}</span>
+          </div>
+          {% if la.presentation_note %}<p style="font-size:13px;margin-top:8px;"><b>PT 메모:</b> {{la.presentation_note}}</p>{% endif %}
+          {% if la.qa_note %}<p style="font-size:13px;"><b>Q&A 메모:</b> {{la.qa_note}}</p>{% endif %}
+          {% if la.feedback_text %}
+          <div style="margin-top:10px;padding:12px;background:var(--gray-50);border-radius:8px;border-left:3px solid var(--primary);">
+            <p style="font-size:12px;color:var(--gray-400);margin-bottom:4px;">대상자 전달 피드백</p>
+            <p style="font-size:14px;white-space:pre-wrap;">{{la.feedback_text}}</p>
+          </div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      {% else %}
+        <p style="color:var(--gray-400);">아직 평가를 제출하지 않았습니다.</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+
+    {% if peer_surveys %}
+    <div class="section">
+      <h3 style="margin-top:0;">동료피드백</h3>
+      {% for ps in peer_surveys %}
+      <div class="card"><b>{{ps.peer_name or '익명'}}</b><p style="margin-top:4px;white-space:pre-wrap;">{{ps.peer_comment}}</p></div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <a href="{{url_for('admin_dashboard')}}" class="btn btn-outline">돌아가기</a>
+    """ + FOOTER, evaluatee=evaluatee, items=items, evaluators=evaluators,
+        evaluator_assessments=evaluator_assessments, item_grades=item_grades,
+        peer_surveys=peer_surveys, rel_labels=RELATIONSHIP_OPTIONS)
+
 
 @app.route("/admin/aggregate/<int:evaluatee_id>")
 @require_role("admin")
