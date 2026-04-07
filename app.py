@@ -259,7 +259,7 @@ def init_db():
         schema_script = """
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
-            role TEXT NOT NULL CHECK (role IN ('admin','target','evaluator')),
+            role TEXT NOT NULL,
             password_hash TEXT, team TEXT, access_start TEXT, access_end TEXT
         );
         CREATE TABLE IF NOT EXISTS evaluation_cycles (
@@ -311,7 +311,7 @@ def init_db():
             source_note TEXT NOT NULL, suggested_questions TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS peer_reviewers (id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS peer_reviewers (id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, user_id INTEGER, email TEXT, password_hash TEXT);
         CREATE TABLE IF NOT EXISTS audit_logs (
             id SERIAL PRIMARY KEY, evaluatee_id INTEGER, actor_user_id INTEGER,
             action TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL
@@ -321,7 +321,7 @@ def init_db():
         schema_script = """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
-            role TEXT NOT NULL CHECK (role IN ('admin','target','evaluator')),
+            role TEXT NOT NULL,
             password_hash TEXT, team TEXT, access_start TEXT, access_end TEXT
         );
         CREATE TABLE IF NOT EXISTS evaluation_cycles (
@@ -373,7 +373,7 @@ def init_db():
             source_note TEXT NOT NULL, suggested_questions TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS peer_reviewers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
+        CREATE TABLE IF NOT EXISTS peer_reviewers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, user_id INTEGER, email TEXT, password_hash TEXT);
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, evaluatee_id INTEGER, actor_user_id INTEGER,
             action TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL
@@ -400,6 +400,9 @@ def init_db():
         _add_col_if_missing("evaluatees", "presentation_storage", "TEXT NOT NULL DEFAULT 'local'")
         _add_col_if_missing("evaluator_assignments", "relationship", "TEXT NOT NULL DEFAULT 'direct_leader'")
         _add_col_if_missing("aggregated_results", "ai_polished_feedback", "TEXT")
+        _add_col_if_missing("peer_reviewers", "email", "TEXT")
+        _add_col_if_missing("peer_reviewers", "password_hash", "TEXT")
+        _add_col_if_missing("peer_reviewers", "user_id", "INTEGER")
 
     if scalar_count(db, "users") == 0:
         db.executemany(
@@ -442,7 +445,8 @@ def init_db():
         )
     db.execute("INSERT INTO app_settings(key, value) VALUES ('peer_visibility', 'evaluator_only') ON CONFLICT(key) DO NOTHING")
     if scalar_count(db, "peer_reviewers") == 0:
-        db.executemany("INSERT INTO peer_reviewers(name) VALUES (?)", [("동료피드백 참여자 김동료",), ("동료피드백 참여자 이동료",), ("동료피드백 참여자 박동료",)])
+        for pname, pemail in [("김동료", "peer1@company.local"), ("이동료", "peer2@company.local"), ("박동료", "peer3@company.local")]:
+            db.execute("INSERT INTO peer_reviewers(name, email, password_hash) VALUES (?,?,?)", (pname, pemail, generate_password_hash("peer1234")))
     db.commit()
     db.close()
 
@@ -861,6 +865,10 @@ def login():
         if user and user["password_hash"] and check_password_hash(user["password_hash"], password):
             session["user_id"] = int(user["id"])
             return redirect(url_for("dashboard"))
+        peer = db.execute("SELECT * FROM peer_reviewers WHERE email = ?", (email,)).fetchone()
+        if peer and peer["password_hash"] and check_password_hash(peer["password_hash"], password):
+            session["peer_id"] = int(peer["id"])
+            return redirect(url_for("peer_dashboard"))
         error = "이메일 또는 비밀번호가 올바르지 않습니다."
     return render_template_string(COMMON_STYLE + """
     <div style="max-width:420px;margin:60px auto;">
@@ -889,8 +897,34 @@ def logout():
     return redirect(url_for("login"))
 
 
+NAV_PEER = """<nav>
+<div class="nav-links"><a href="/peer">대시보드</a></div>
+<div class="nav-right"><a href="/logout">로그아웃</a></div>
+</nav>"""
+
+PEER_FEEDBACK_GUIDE = """
+<div class="section" style="background:var(--primary-light);border-color:var(--primary);">
+  <h3 style="margin-top:0;color:var(--primary);">동료피드백 작성 가이드</h3>
+  <p style="font-size:14px;line-height:1.8;color:var(--gray-700);">
+    동료피드백은 수습 대상자의 성장과 조직 적응을 돕기 위한 중요한 과정입니다.<br/>
+    아래 가이드를 참고하여 구체적이고 건설적인 피드백을 작성해 주세요.
+  </p>
+  <ul style="font-size:13px;line-height:2;color:var(--gray-600);padding-left:20px;">
+    <li><b>구체적인 사례 중심:</b> "열심히 했다" 보다는 "A 프로젝트에서 기한 내 결과물을 제출했다" 처럼 구체적으로 작성</li>
+    <li><b>행동 기반:</b> 성격이나 태도보다는 관찰 가능한 행동과 결과를 중심으로 기술</li>
+    <li><b>균형 잡힌 시각:</b> 잘한 점(강점)과 개선이 필요한 점을 함께 기술</li>
+    <li><b>건설적 제안:</b> 문제점만 지적하기보다 구체적 개선 방향을 함께 제안</li>
+    <li><b>협업 관점:</b> 팀 내 소통, 협업 태도, 업무 공유 등 함께 일하는 관점에서 피드백</li>
+    <li><b>존중과 배려:</b> 동료로서 존중하는 톤으로 작성</li>
+  </ul>
+</div>
+"""
+
+
 @app.route("/dashboard")
 def dashboard():
+    if session.get("peer_id"):
+        return redirect(url_for("peer_dashboard"))
     user = current_user()
     if not user:
         return redirect(url_for("login"))
@@ -899,6 +933,114 @@ def dashboard():
     if user["role"] == "target":
         return redirect(url_for("target_dashboard"))
     return redirect(url_for("evaluator_dashboard"))
+
+
+# ---------------------------------------------------------------------------
+# Peer feedback participant dashboard
+# ---------------------------------------------------------------------------
+
+@app.route("/peer", methods=["GET", "POST"])
+def peer_dashboard():
+    peer_id = session.get("peer_id")
+    if not peer_id:
+        return redirect(url_for("login"))
+    db = get_db()
+    peer = db.execute("SELECT * FROM peer_reviewers WHERE id=?", (peer_id,)).fetchone()
+    if not peer:
+        session.clear()
+        return redirect(url_for("login"))
+    notice = request.args.get("notice", "")
+
+    assignments = db.execute("""
+        SELECT pfa.evaluatee_id, u.name AS target_name, u.team AS target_team,
+               c.name AS cycle_name, e.presentation_filename
+        FROM peer_feedback_assignments pfa
+        JOIN evaluatees e ON e.id = pfa.evaluatee_id
+        JOIN users u ON u.id = e.user_id
+        JOIN evaluation_cycles c ON c.id = e.cycle_id
+        WHERE pfa.peer_reviewer_id = ?
+        ORDER BY e.id DESC
+    """, (peer_id,)).fetchall()
+
+    selected = request.args.get("evaluatee_id")
+    target_detail = None
+    existing_feedback = []
+    if selected:
+        target_detail = db.execute("""
+            SELECT e.id, u.name AS target_name, u.team AS target_team, c.name AS cycle_name
+            FROM evaluatees e JOIN users u ON u.id=e.user_id JOIN evaluation_cycles c ON c.id=e.cycle_id
+            WHERE e.id=?
+        """, (selected,)).fetchone()
+        existing_feedback = db.execute(
+            "SELECT * FROM peer_surveys WHERE evaluatee_id=? AND peer_name=? ORDER BY id DESC",
+            (selected, peer["name"]),
+        ).fetchall()
+
+    if request.method == "POST":
+        evaluatee_id = request.form.get("evaluatee_id")
+        comment = request.form.get("peer_comment", "").strip()
+        if evaluatee_id and comment:
+            db.execute(
+                "INSERT INTO peer_surveys(evaluatee_id, peer_name, peer_comment, created_at) VALUES (?,?,?,?)",
+                (evaluatee_id, peer["name"], comment, now()),
+            )
+            log_action(db, "peer_feedback_submitted", evaluatee_id=int(evaluatee_id), actor_user_id=None, detail=f"동료피드백 제출: {peer['name']}")
+            db.commit()
+            return redirect(url_for("peer_dashboard", evaluatee_id=evaluatee_id, notice="피드백이 성공적으로 제출되었습니다."))
+
+    return render_template_string(COMMON_STYLE + NAV_PEER + """
+    <h1>동료피드백 참여자 화면</h1>
+    <p class="subtitle">{{peer.name}} · {{peer.email}}</p>
+    {% if notice %}<div class="alert alert-success">{{notice}}</div>{% endif %}
+
+    """ + PEER_FEEDBACK_GUIDE + """
+
+    <div class="section">
+      <h3 style="margin-top:0;">배정된 피드백 대상자</h3>
+      {% if assignments %}
+      <table>
+        <tr><th>대상자</th><th>팀</th><th>사이클</th><th>액션</th></tr>
+        {% for a in assignments %}
+        <tr {% if selected == a.evaluatee_id|string %}style="background:var(--primary-light);"{% endif %}>
+          <td><b>{{a.target_name}}</b></td>
+          <td>{{a.target_team or '-'}}</td>
+          <td>{{a.cycle_name}}</td>
+          <td><a href="{{url_for('peer_dashboard', evaluatee_id=a.evaluatee_id)}}" class="btn btn-outline btn-sm">피드백 작성</a></td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% else %}
+      <p style="color:var(--gray-400);">아직 배정된 대상자가 없습니다. 관리자에게 문의해 주세요.</p>
+      {% endif %}
+    </div>
+
+    {% if target_detail %}
+    <div class="section">
+      <h3 style="margin-top:0;">{{target_detail.target_name}} <span style="font-weight:400;color:var(--gray-400);">{{target_detail.target_team or ''}}</span></h3>
+
+      {% if existing_feedback %}
+      <h3>내가 작성한 피드백</h3>
+      {% for fb in existing_feedback %}
+      <div class="card">
+        <div style="font-size:12px;color:var(--gray-400);">{{fb.created_at}}</div>
+        <p style="margin-top:6px;white-space:pre-wrap;">{{fb.peer_comment}}</p>
+      </div>
+      {% endfor %}
+      {% endif %}
+
+      <h3>{{'추가 피드백 작성' if existing_feedback else '피드백 작성'}}</h3>
+      <form method="post">
+        <input type="hidden" name="evaluatee_id" value="{{target_detail.id}}"/>
+        <div class="form-group">
+          <label>피드백 내용</label>
+          <textarea name="peer_comment" rows="8" required placeholder="위 가이드를 참고하여 구체적이고 건설적인 피드백을 작성해 주세요.&#10;&#10;예시:&#10;- 잘한 점: A 프로젝트에서 적극적으로 의견을 제시하고...&#10;- 개선 필요: 일정 관리 측면에서...&#10;- 제안: 주간 단위로 진행상황을 공유하면..."></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary">피드백 제출</button>
+      </form>
+    </div>
+    {% endif %}
+    """ + FOOTER, peer=peer, assignments=assignments, selected=selected,
+        target_detail=target_detail, existing_feedback=existing_feedback, notice=notice)
 
 
 # ---------------------------------------------------------------------------
@@ -1393,10 +1535,12 @@ def peer_feedback(token):
               <p class="subtitle">동료피드백이 성공적으로 제출되었습니다.</p>
             </div>""" + FOOTER)
     return render_template_string(COMMON_STYLE + """
-    <div style="max-width:600px;margin:40px auto;">
+    <div style="max-width:700px;margin:40px auto;">
+      """ + PEER_FEEDBACK_GUIDE + """
       <div class="section">
         <h2 style="margin-bottom:4px;">동료피드백 작성</h2>
         <p class="subtitle">대상자: <b>{{evaluatee.target_name}}</b></p>
+        <p style="font-size:13px;color:var(--gray-500);margin-bottom:16px;">로그인 계정이 있는 경우 <a href="/login">로그인</a>하여 작성하면 더 편리합니다.</p>
         <form method="post">
           <div class="form-group">
             <label>동료피드백 참여자 선택</label>
@@ -1412,7 +1556,7 @@ def peer_feedback(token):
           </div>
           <div class="form-group">
             <label>피드백</label>
-            <textarea name="peer_comment" rows="6" required placeholder="대상자에 대한 피드백을 자유롭게 작성해주세요."></textarea>
+            <textarea name="peer_comment" rows="8" required placeholder="위 가이드를 참고하여 구체적이고 건설적인 피드백을 작성해 주세요.&#10;&#10;예시:&#10;- 잘한 점: ...&#10;- 개선 필요: ...&#10;- 제안: ..."></textarea>
           </div>
           <button type="submit" class="btn btn-primary" style="width:100%;">제출</button>
         </form>
@@ -1966,14 +2110,26 @@ def manage_peers():
         action = request.form.get("action")
         if action == "add":
             name = request.form.get("name", "").strip()
-            if name:
-                db.execute("INSERT INTO peer_reviewers(name) VALUES (?) ON CONFLICT(name) DO NOTHING", (name,))
+            email = request.form.get("email", "").strip()
+            password = request.form.get("password", "").strip() or "peer1234"
+            if name and email:
+                db.execute(
+                    "INSERT INTO peer_reviewers(name, email, password_hash) VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET email=excluded.email, password_hash=excluded.password_hash",
+                    (name, email, generate_password_hash(password)),
+                )
                 actor = current_user()
-                log_action(db, "peer_reviewer_added", actor_user_id=actor["id"] if actor else None, detail=name)
+                log_action(db, "peer_reviewer_added", actor_user_id=actor["id"] if actor else None, detail=f"{name} / {email}")
+                db.commit()
+        elif action == "reset_password":
+            peer_id = request.form.get("peer_id")
+            new_password = request.form.get("new_password", "").strip()
+            if peer_id and new_password:
+                db.execute("UPDATE peer_reviewers SET password_hash=? WHERE id=?", (generate_password_hash(new_password), peer_id))
                 db.commit()
         elif action == "delete":
             peer_id = request.form.get("peer_id")
             if peer_id:
+                db.execute("DELETE FROM peer_feedback_assignments WHERE peer_reviewer_id=?", (peer_id,))
                 db.execute("DELETE FROM peer_reviewers WHERE id=?", (peer_id,))
                 actor = current_user()
                 log_action(db, "peer_reviewer_deleted", actor_user_id=actor["id"] if actor else None, detail=f"peer_id={peer_id}")
@@ -1982,21 +2138,38 @@ def manage_peers():
     peers = db.execute("SELECT * FROM peer_reviewers ORDER BY id").fetchall()
     return render_template_string(COMMON_STYLE + NAV_ADMIN + """
     <h1>동료피드백 참여자 관리</h1>
+    <p class="subtitle">참여자에게 이메일/비밀번호를 부여하면 로그인하여 직접 피드백을 작성할 수 있습니다</p>
     <div class="section">
-      <form method="post" class="form-row" style="align-items:end;">
+      <h3 style="margin-top:0;">참여자 추가</h3>
+      <form method="post">
         <input type="hidden" name="action" value="add"/>
-        <div class="form-group" style="flex:2;"><label>이름</label><input type="text" name="name" required/></div>
-        <div class="form-group" style="flex:0;"><button type="submit" class="btn btn-primary">추가</button></div>
+        <div class="form-row">
+          <div class="form-group"><label>이름</label><input type="text" name="name" required/></div>
+          <div class="form-group"><label>이메일 (로그인용)</label><input type="email" name="email" required/></div>
+          <div class="form-group"><label>비밀번호</label><input type="text" name="password" placeholder="미입력 시 peer1234"/></div>
+        </div>
+        <button type="submit" class="btn btn-primary">추가</button>
       </form>
     </div>
     <div class="section">
       <table>
-        <tr><th>이름</th><th>액션</th></tr>
+        <tr><th>이름</th><th>이메일</th><th>비밀번호 변경</th><th>액션</th></tr>
         {% for p in peers %}
         <tr>
-          <td>{{p.name}}</td>
-          <td><form method="post" style="display:inline"><input type="hidden" name="action" value="delete"/><input type="hidden" name="peer_id" value="{{p.id}}"/>
-            <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('삭제하시겠습니까?')">삭제</button></form></td>
+          <td><b>{{p.name}}</b></td>
+          <td style="font-size:13px;">{{p.email or '-'}}</td>
+          <td>
+            <form method="post" style="display:inline;">
+              <input type="hidden" name="action" value="reset_password"/>
+              <input type="hidden" name="peer_id" value="{{p.id}}"/>
+              <input type="text" name="new_password" placeholder="새 비번" style="width:90px;padding:4px 6px;font-size:12px;" required/>
+              <button type="submit" class="btn btn-outline btn-sm">변경</button>
+            </form>
+          </td>
+          <td>
+            <form method="post" style="display:inline"><input type="hidden" name="action" value="delete"/><input type="hidden" name="peer_id" value="{{p.id}}"/>
+            <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('삭제하시겠습니까?')">삭제</button></form>
+          </td>
         </tr>
         {% endfor %}
       </table>
