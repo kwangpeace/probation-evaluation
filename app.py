@@ -261,7 +261,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
             role TEXT NOT NULL,
-            password_hash TEXT, team TEXT, access_start TEXT, access_end TEXT
+            password_hash TEXT, team TEXT, position TEXT, department TEXT, hire_date TEXT,
+            access_start TEXT, access_end TEXT
         );
         CREATE TABLE IF NOT EXISTS evaluation_cycles (
             id SERIAL PRIMARY KEY, name TEXT NOT NULL, start_date TEXT, end_date TEXT,
@@ -323,7 +324,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
             role TEXT NOT NULL,
-            password_hash TEXT, team TEXT, access_start TEXT, access_end TEXT
+            password_hash TEXT, team TEXT, position TEXT, department TEXT, hire_date TEXT,
+            access_start TEXT, access_end TEXT
         );
         CREATE TABLE IF NOT EXISTS evaluation_cycles (
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, start_date TEXT, end_date TEXT,
@@ -383,7 +385,7 @@ def init_db():
     db.executescript(schema_script)
 
     if USE_POSTGRES:
-        for col, typ in [("password_hash", "TEXT"), ("team", "TEXT"), ("access_start", "TEXT"), ("access_end", "TEXT")]:
+        for col, typ in [("password_hash", "TEXT"), ("team", "TEXT"), ("position", "TEXT"), ("department", "TEXT"), ("hire_date", "TEXT"), ("access_start", "TEXT"), ("access_end", "TEXT")]:
             db.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} {typ}")
         db.execute("ALTER TABLE evaluatees ADD COLUMN IF NOT EXISTS presentation_file_id TEXT")
         db.execute("ALTER TABLE evaluatees ADD COLUMN IF NOT EXISTS presentation_storage TEXT NOT NULL DEFAULT 'local'")
@@ -395,7 +397,7 @@ def init_db():
             names = {c["name"] if hasattr(c, "keys") else c[1] for c in cols}
             if col not in names:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
-        for col, typ in [("password_hash", "TEXT"), ("team", "TEXT"), ("access_start", "TEXT"), ("access_end", "TEXT")]:
+        for col, typ in [("password_hash", "TEXT"), ("team", "TEXT"), ("position", "TEXT"), ("department", "TEXT"), ("hire_date", "TEXT"), ("access_start", "TEXT"), ("access_end", "TEXT")]:
             _add_col_if_missing("users", col, typ)
         _add_col_if_missing("evaluatees", "presentation_file_id", "TEXT")
         _add_col_if_missing("evaluatees", "presentation_storage", "TEXT NOT NULL DEFAULT 'local'")
@@ -1923,7 +1925,7 @@ def deliver_feedback(evaluatee_id):
 @require_role("admin")
 def admin_report(evaluatee_id):
     db = get_db()
-    evaluatee = db.execute("SELECT e.*, u.name AS target_name, u.team AS target_team, u.email AS target_email, c.name AS cycle_name FROM evaluatees e JOIN users u ON u.id=e.user_id JOIN evaluation_cycles c ON c.id=e.cycle_id WHERE e.id=?", (evaluatee_id,)).fetchone()
+    evaluatee = db.execute("SELECT e.*, u.name AS target_name, u.team AS target_team, u.email AS target_email, u.position AS target_position, u.department AS target_department, u.hire_date AS target_hire_date, c.name AS cycle_name FROM evaluatees e JOIN users u ON u.id=e.user_id JOIN evaluation_cycles c ON c.id=e.cycle_id WHERE e.id=?", (evaluatee_id,)).fetchone()
     if not evaluatee:
         abort(404)
     items = db.execute("SELECT * FROM assessment_items ORDER BY id").fetchall()
@@ -1955,8 +1957,10 @@ def admin_report(evaluatee_id):
     <div class="section">
       <h3 style="margin-top:0;">대상자 정보</h3>
       <table>
-        <tr><th style="width:140px;">이름</th><td>{{evaluatee.target_name}}</td><th style="width:140px;">팀</th><td>{{evaluatee.target_team or '-'}}</td></tr>
-        <tr><th>이메일</th><td>{{evaluatee.target_email}}</td><th>자가평가 제출</th><td>{{evaluatee.self_submitted_at or '미제출'}}</td></tr>
+        <tr><th style="width:140px;">이름</th><td>{{evaluatee.target_name}}</td><th style="width:140px;">부서</th><td>{{evaluatee.target_department or '-'}}</td></tr>
+        <tr><th>이메일</th><td>{{evaluatee.target_email}}</td><th>팀</th><td>{{evaluatee.target_team or '-'}}</td></tr>
+        <tr><th>직급/직책</th><td>{{evaluatee.target_position or '-'}}</td><th>입사일</th><td>{{evaluatee.target_hire_date or '-'}}</td></tr>
+        <tr><th>자가평가 제출</th><td colspan="3">{{evaluatee.self_submitted_at or '미제출'}}</td></tr>
         <tr><th>현재 단계</th><td>{{progress.status}}</td><th>평가자 제출</th><td>{{progress.evaluator_done_count}} / {{progress.assigned_count}}</td></tr>
       </table>
     </div>
@@ -2131,25 +2135,32 @@ def manage_users():
             role = request.form.get("role", "target")
             password = request.form.get("password", "").strip()
             team = request.form.get("team", "").strip()
+            position = request.form.get("position", "").strip()
+            department = request.form.get("department", "").strip()
+            hire_date = request.form.get("hire_date", "").strip() or None
             access_start = request.form.get("access_start", "").strip() or None
             access_end = request.form.get("access_end", "").strip() or None
             if name and email and role in ("admin", "target", "evaluator"):
                 if not password:
                     password = {"target": "target1234", "evaluator": "leader1234", "admin": "admin1234"}.get(role, "pass1234")
-                db.execute("INSERT INTO users(name, email, role, password_hash, team, access_start, access_end) VALUES (?,?,?,?,?,?,?)",
-                           (name, email, role, generate_password_hash(password), team, access_start, access_end))
+                db.execute("INSERT INTO users(name, email, role, password_hash, team, position, department, hire_date, access_start, access_end) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                           (name, email, role, generate_password_hash(password), team, position, department, hire_date, access_start, access_end))
                 actor = current_user()
                 log_action(db, "user_added", actor_user_id=actor["id"] if actor else None, detail=f"{name} / {role}")
                 db.commit()
-        elif action == "update_access":
+        elif action == "update_profile":
             user_id = request.form.get("user_id")
+            team = request.form.get("team", "").strip()
+            position = request.form.get("position", "").strip()
+            department = request.form.get("department", "").strip()
+            hire_date = request.form.get("hire_date", "").strip() or None
             access_start = request.form.get("access_start", "").strip() or None
             access_end = request.form.get("access_end", "").strip() or None
-            team = request.form.get("team", "").strip()
             if user_id:
-                db.execute("UPDATE users SET access_start=?, access_end=?, team=? WHERE id=?", (access_start, access_end, team, user_id))
+                db.execute("UPDATE users SET team=?, position=?, department=?, hire_date=?, access_start=?, access_end=? WHERE id=?",
+                           (team, position, department, hire_date, access_start, access_end, user_id))
                 actor = current_user()
-                log_action(db, "user_access_updated", actor_user_id=actor["id"] if actor else None, detail=f"user_id={user_id}")
+                log_action(db, "user_profile_updated", actor_user_id=actor["id"] if actor else None, detail=f"user_id={user_id}")
                 db.commit()
         elif action == "reset_password":
             user_id = request.form.get("user_id")
@@ -2170,7 +2181,7 @@ def manage_users():
     users = db.execute("SELECT * FROM users ORDER BY role, id").fetchall()
     return render_template_string(COMMON_STYLE + NAV_ADMIN + """
     <h1>사용자 관리</h1>
-    <p class="subtitle">사용자 추가, 접근기간 설정, 팀 배정을 관리합니다</p>
+    <p class="subtitle">사용자 추가, 대상자 프로필(직급/부서/입사일), 접근기간을 관리합니다</p>
 
     <div class="section">
       <h3 style="margin-top:0;">사용자 추가</h3>
@@ -2182,10 +2193,15 @@ def manage_users():
           <div class="form-group"><label>역할</label>
             <select name="role"><option value="target">평가대상자</option><option value="evaluator">평가자</option><option value="admin">관리자</option></select>
           </div>
+          <div class="form-group"><label>초기 비밀번호</label><input type="text" name="password" placeholder="미입력 시 기본값"/></div>
         </div>
         <div class="form-row">
+          <div class="form-group"><label>부서</label><input type="text" name="department" placeholder="예: 경영지원본부"/></div>
           <div class="form-group"><label>팀</label><input type="text" name="team" placeholder="예: 개발팀"/></div>
-          <div class="form-group"><label>초기 비밀번호</label><input type="text" name="password" placeholder="미입력 시 기본값"/></div>
+          <div class="form-group"><label>직급/직책</label><input type="text" name="position" placeholder="예: 사원"/></div>
+          <div class="form-group"><label>입사일</label><input type="date" name="hire_date"/></div>
+        </div>
+        <div class="form-row">
           <div class="form-group"><label>접근 시작일</label><input type="date" name="access_start"/></div>
           <div class="form-group"><label>접근 종료일</label><input type="date" name="access_end"/></div>
         </div>
@@ -2195,37 +2211,45 @@ def manage_users():
 
     <div class="section">
       <h3 style="margin-top:0;">사용자 목록</h3>
-      <table>
-        <tr><th>이름</th><th>이메일</th><th>역할</th><th>팀</th><th>접근기간</th><th>액션</th></tr>
-        {% for u in users %}
-        <tr>
-          <td><b>{{u.name}}</b></td>
-          <td style="font-size:13px;">{{u.email}}</td>
-          <td>{% if u.role=='admin' %}<span class="badge badge-danger">관리자</span>{% elif u.role=='target' %}<span class="badge badge-info">대상자</span>{% else %}<span class="badge badge-warning">평가자</span>{% endif %}</td>
-          <td>{{u.team or '-'}}</td>
-          <td style="font-size:12px;">{{u.access_start or '∞'}} ~ {{u.access_end or '∞'}}</td>
-          <td style="white-space:nowrap;">
-            <form method="post" style="display:inline;">
-              <input type="hidden" name="action" value="update_access"/>
-              <input type="hidden" name="user_id" value="{{u.id}}"/>
-              <input type="text" name="team" value="{{u.team or ''}}" placeholder="팀" style="width:70px;padding:4px 6px;font-size:12px;"/>
-              <input type="date" name="access_start" value="{{u.access_start or ''}}" style="width:120px;padding:4px 6px;font-size:12px;"/>
-              <input type="date" name="access_end" value="{{u.access_end or ''}}" style="width:120px;padding:4px 6px;font-size:12px;"/>
-              <button type="submit" class="btn btn-outline btn-sm">저장</button>
-            </form>
-            <form method="post" style="display:inline;margin-left:4px;">
-              <input type="hidden" name="action" value="reset_password"/><input type="hidden" name="user_id" value="{{u.id}}"/>
-              <input type="text" name="new_password" placeholder="새 비번" style="width:80px;padding:4px 6px;font-size:12px;" required/>
-              <button type="submit" class="btn btn-outline btn-sm">변경</button>
-            </form>
-            <form method="post" style="display:inline;margin-left:4px;">
-              <input type="hidden" name="action" value="delete"/><input type="hidden" name="user_id" value="{{u.id}}"/>
-              <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('삭제하시겠습니까?')">삭제</button>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-      </table>
+      {% for u in users %}
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <div>
+            <b style="font-size:16px;">{{u.name}}</b>
+            {% if u.role=='admin' %}<span class="badge badge-danger" style="margin-left:8px;">관리자</span>{% elif u.role=='target' %}<span class="badge badge-info" style="margin-left:8px;">대상자</span>{% else %}<span class="badge badge-warning" style="margin-left:8px;">평가자</span>{% endif %}
+          </div>
+          <div style="font-size:13px;color:var(--gray-500);">{{u.email}}</div>
+        </div>
+        <form method="post">
+          <input type="hidden" name="action" value="update_profile"/>
+          <input type="hidden" name="user_id" value="{{u.id}}"/>
+          <div class="form-row">
+            <div class="form-group"><label>부서</label><input type="text" name="department" value="{{u.department or ''}}" placeholder="부서"/></div>
+            <div class="form-group"><label>팀</label><input type="text" name="team" value="{{u.team or ''}}" placeholder="팀"/></div>
+            <div class="form-group"><label>직급/직책</label><input type="text" name="position" value="{{u.position or ''}}" placeholder="직급"/></div>
+            <div class="form-group"><label>입사일</label><input type="date" name="hire_date" value="{{u.hire_date or ''}}"/></div>
+          </div>
+          <div class="form-row">
+            <div class="form-group"><label>접근 시작일</label><input type="date" name="access_start" value="{{u.access_start or ''}}"/></div>
+            <div class="form-group"><label>접근 종료일</label><input type="date" name="access_end" value="{{u.access_end or ''}}"/></div>
+            <div class="form-group" style="display:flex;align-items:end;gap:8px;">
+              <button type="submit" class="btn btn-primary btn-sm">프로필 저장</button>
+            </div>
+          </div>
+        </form>
+        <div style="margin-top:8px;display:flex;gap:8px;">
+          <form method="post" style="display:flex;gap:4px;align-items:center;">
+            <input type="hidden" name="action" value="reset_password"/><input type="hidden" name="user_id" value="{{u.id}}"/>
+            <input type="text" name="new_password" placeholder="새 비밀번호" style="width:120px;padding:4px 8px;font-size:12px;" required/>
+            <button type="submit" class="btn btn-outline btn-sm">비번 변경</button>
+          </form>
+          <form method="post">
+            <input type="hidden" name="action" value="delete"/><input type="hidden" name="user_id" value="{{u.id}}"/>
+            <button type="submit" class="btn btn-danger btn-sm" onclick="return confirm('삭제하시겠습니까?')">삭제</button>
+          </form>
+        </div>
+      </div>
+      {% endfor %}
     </div>
     """ + FOOTER, users=users)
 
