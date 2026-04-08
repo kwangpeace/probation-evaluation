@@ -412,6 +412,10 @@ def init_db():
             "INSERT INTO users(name, email, role, password_hash, team) VALUES (?, ?, ?, ?, ?)",
             [
                 ("HR 관리자", "admin@company.local", "admin", generate_password_hash("admin1234"), "인사팀"),
+                ("김성균", "kskim@mondrian.ai", "admin", generate_password_hash("1234"), ""),
+                ("HR-Mondrian", "hr-mondrian@mondrian.ai", "admin", generate_password_hash("1234"), ""),
+                ("한", "han@mondrian.ai", "admin", generate_password_hash("1234"), ""),
+                ("홍", "hong@mondrian.ai", "admin", generate_password_hash("1234"), ""),
                 ("대상자 김수습", "target1@company.local", "target", generate_password_hash("target1234"), "개발팀"),
                 ("대상자 박수습", "target2@company.local", "target", generate_password_hash("target1234"), "디자인팀"),
                 ("평가자 이리더", "leader1@company.local", "evaluator", generate_password_hash("leader1234"), "개발팀"),
@@ -423,6 +427,9 @@ def init_db():
         db.execute("UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='admin'", (generate_password_hash("admin1234"),))
         db.execute("UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='target'", (generate_password_hash("target1234"),))
         db.execute("UPDATE users SET password_hash=? WHERE password_hash IS NULL AND role='evaluator'", (generate_password_hash("leader1234"),))
+        for mname, memail in [("김성균", "kskim@mondrian.ai"), ("HR-Mondrian", "hr-mondrian@mondrian.ai"), ("한", "han@mondrian.ai"), ("홍", "hong@mondrian.ai")]:
+            db.execute("INSERT INTO users(name, email, role, password_hash) VALUES (?,?,?,?) ON CONFLICT(email) DO NOTHING",
+                       (mname, memail, "admin", generate_password_hash("1234")))
     if scalar_count(db, "evaluation_cycles") == 0:
         db.execute("INSERT INTO evaluation_cycles(name, start_date, end_date) VALUES (?, ?, ?)", ("2026년 1분기 수습평가", "2026-01-01", "2026-03-31"))
     if scalar_count(db, "assessment_items") == 0:
